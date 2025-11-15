@@ -1,159 +1,250 @@
+ # Save this file as train.py
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
-import chess_cnn
+from torch.utils.data import Dataset, DataLoader
+import pickle
+import numpy as np
+import os
+from tqdm import tqdm
+from chess_cnn import ChessCNN  # Your custom model
 
-# --- 1. Configuration ---
+# --- Configuration ---
+TRAIN_DATA_FILE = '../chess_training_data_value_uniform.pkl'
+VAL_DATA_FILE = '../validation.pkl'
+MODEL_SAVE_PATH = 'chess_cnn.pth'
+NUM_WORKERS = 1
+
+# --- Hyperparameters ---
 BATCH_SIZE = 256
-NUM_EPOCHS = 5
-VALUE_LR = 1e-4
-POLICY_LR = 5e-4
-BODY_LR = 1e-3
+LEARNING_RATE = 0.001
+NUM_EPOCHS = 50
+L1_LAMBDA = 1e-5
 
-# Set device
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Using device: {DEVICE}")
+def load_data_and_create_maps(train_file, val_file):
+    """
+    Loads the processed data from both train and validation files
+    and creates a unified mapping from move strings to an integer index.
+    """
+    print(f"Loading training data from {train_file}...")
+    if not os.path.exists(train_file):
+        print(f"Error: Training file not found at {train_file}")
+        exit(1)
+    with open(train_file, 'rb') as f:
+        train_data = pickle.load(f)
+    if not train_data:
+        print("Error: Training data file is empty.")
+        exit(1)
+    print(f"Loaded {len(train_data)} training samples.")
 
-class DummyChessDataset(Dataset):
-    def __init__(self, num_samples, in_channels, num_policy_outputs):
-        self.num_samples = num_samples
-        self.in_channels = in_channels
-        self.num_policy_outputs = num_policy_outputs
-        
+    print(f"Loading validation data from {val_file}...")
+    if not os.path.exists(val_file):
+        print(f"Error: Validation file not found at {val_file}")
+        exit(1)
+    with open(val_file, 'rb') as f:
+        val_data = pickle.load(f)
+    if not val_data:
+        print("Error: Validation data file is empty.")
+        exit(1)
+    print(f"Loaded {len(val_data)} validation samples.")
+
+    # --- Create a UNIFIED move map ---
+    train_moves = set(item[2] for item in train_data)
+    val_moves = set(item[2] for item in val_data)
+    policy_moves = train_moves | val_moves
+
+    INDEX_TO_MOVE = sorted(list(policy_moves))
+    MOVE_TO_INDEX = {move: i for i, move in enumerate(INDEX_TO_MOVE)}
+
+    num_policy_outputs = len(INDEX_TO_MOVE)
+    print(f"Created unified policy map with {num_policy_outputs} unique moves.")
+
+    return train_data, val_data, MOVE_TO_INDEX, INDEX_TO_MOVE, num_policy_outputs
+
+class ChessDataset(Dataset):
+    """Custom PyTorch Dataset for loading the chess data."""
+
+    def __init__(self, data, move_to_index_map):
+        self.data = data
+        self.move_to_index_map = move_to_index_map
+
+        # Debug: check the structure of one sample
+        if self.data:
+            print("Sample training entry:", self.data[0])
+        else:
+            print("Warning: Dataset is empty.")
+
     def __len__(self):
-        return self.num_samples
-        
+        return len(self.data)
+
     def __getitem__(self, idx):
-        # Dummy input board state
-        board_state = torch.randn((self.in_channels, 8, 8))
-        
-        # Dummy value target (random float between -1 and 1)
-        value_target = torch.rand(1) * 2 - 1
-        
-        # Dummy policy target (a single move index)
-        # CrossEntropyLoss expects a single long int, not a one-hot vector
-        policy_target = torch.randint(0, self.num_policy_outputs, ()).long()
-        
-        return board_state, value_target, policy_target
+        board_tensor, value_target, policy_target_str = self.data[idx]
 
-# --- 3. Loss Functions ---
-# Use standard nn.MSELoss for the value head (it's the L2 loss)
-value_loss_fn = nn.MSELoss()
-# Use CrossEntropyLoss for the policy head (classification)
-policy_loss_fn = nn.CrossEntropyLoss()
+        # 1. Board Tensor
+        board_tensor = torch.tensor(board_tensor, dtype=torch.float32)
 
+        # 2. Value Target
+        value_target = torch.tensor([value_target], dtype=torch.float32)
 
-# --- Set up Optimizer with Different Learning Rates ---
-print("Setting up optimizer parameter groups...")
+        # 3. Policy Target
+        policy_target_idx = self.move_to_index_map[policy_target_str]
+        policy_target = torch.tensor(policy_target_idx, dtype=torch.long)
 
-# Group 1: Shared "Body" parameters
-body_params = list(model.conv_in.parameters()) + \
-              list(model.bn_in.parameters()) + \
-              list(model.res_stack.parameters())
+        return board_tensor, value_target, policy_target
 
-# Group 2: Value Head parameters
-value_head_params = list(model.value_head.parameters())
-
-# Group 3: Policy Head parameters
-policy_head_params = list(model.policy_head.parameters())
-
-optimizer = optim.Adam([
-    {'params': body_params, 'lr': BODY_LR},
-    {'params': value_head_params, 'lr': VALUE_LR},
-    {'params': policy_head_params, 'lr': POLICY_LR}
-])
-
-print(f"Total param groups: {len(optimizer.param_groups)}")
-print(f"  Body LR:   {optimizer.param_groups[0]['lr']}")
-print(f"  Value LR:  {optimizer.param_groups[1]['lr']}")
-print(f"  Policy LR: {optimizer.param_groups[2]['lr']}")
-
-# --- 5. Create DataLoaders ---
-# (Using the Dummy Dataset for this example)
-train_data = DummyChessDataset(1000, model.in_channels, NUM_POLICY_OUTPUTS)
-test_data = DummyChessDataset(200, model.in_channels, NUM_POLICY_OUTPUTS)
-
-train_dataloader = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=True)
-test_dataloader = DataLoader(test_data, batch_size=BATCH_SIZE)
-
-# --- 6. Training Function ---
-def train(dataloader, model, val_loss_fn, pol_loss_fn, optimizer):
-    size = len(dataloader.dataset)
-    model.train()
-    for batch, (X, y_value, y_policy) in enumerate(dataloader):
-        # Move data to the device
-        X = X.to(DEVICE)
-        y_value = y_value.to(DEVICE)
-        y_policy = y_policy.to(DEVICE)
-
-        # --- Compute prediction error ---
-        # Model returns two heads
-        pred_value, pred_policy = model(X)
-
-        # --- Calculate losses for each head ---
-        # Note: pred_value is (N, 1) and y_value is (N, 1)
-        #       pred_policy is (N, C) and y_policy is (N)
-        loss_v = val_loss_fn(pred_value, y_value)
-        loss_p = pol_loss_fn(pred_policy, y_policy)
-        
-        # Combine losses (with 2x weight on value loss, as in your example)
-        loss = (loss_v * 2.0) + loss_p
-
-        # --- Backpropagation ---
-        loss.backward()
-        optimizer.step()
-        optimizer.zero_grad()
-
-        if batch % 10 == 0:
-            loss_val = loss.item()
-            current = (batch + 1) * len(X)
-            print(f"  loss: {loss_val:>7f}  [{current:>5d}/{size:>5d}]")
-
-# --- 7. Test Function ---
-def test(dataloader, model, val_loss_fn, pol_loss_fn):
-    size = len(dataloader.dataset)
-    num_batches = len(dataloader)
-    model.eval()
-    
-    total_loss, policy_correct = 0, 0
-
-    with torch.no_grad():
-        for X, y_value, y_policy in dataloader:
-            # Move data to the device
-            X = X.to(DEVICE)
-            y_value = y_value.to(DEVICE)
-            y_policy = y_policy.to(DEVICE)
-            
-            # --- Forward pass ---
-            pred_value, pred_policy = model(X)
-            
-            # --- Calculate and sum loss ---
-            loss_v = val_loss_fn(pred_value, y_value)
-            loss_p = pol_loss_fn(pred_policy, y_policy)
-            total_loss += ((loss_v * 2.0) + loss_p).item()
-
-            # --- Calculate policy accuracy ---
-            policy_correct += (pred_policy.argmax(1) == y_policy).type(torch.float).sum().item()
-
-    avg_loss = total_loss / num_batches
-    policy_accuracy = policy_correct / size
-    
-    print(f"Test Error: ")
-    print(f"  Policy Accuracy: {(100*policy_accuracy):>0.1f}%")
-    print(f"  Avg Combined loss: {avg_loss:>8f} \n")
-
-# --- 8. Main Execution Loop ---
 def main():
-    
-    model = chess_cnn.ChessCNN(num_policy_outputs=NUM_POLICY_OUTPUTS).to(DEVICE)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
-    print("Starting Training...\n")
+    # 1. Load data and create mappings
+    train_data, val_data, MOVE_TO_INDEX, INDEX_TO_MOVE, NUM_POLICY_OUTPUTS = \
+        load_data_and_create_maps(TRAIN_DATA_FILE, VAL_DATA_FILE)
+
+    print(f"Training samples: {len(train_data)}, Validation samples: {len(val_data)}")
+
+    # 2. Create Datasets and DataLoaders
+    train_dataset = ChessDataset(train_data, MOVE_TO_INDEX)
+    val_dataset = ChessDataset(val_data, MOVE_TO_INDEX)
+
+    num_workers_to_use = NUM_WORKERS
+    print(f"Using {num_workers_to_use} workers for data loading.")
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=num_workers_to_use,
+        pin_memory=(device.type == 'cuda'),
+        persistent_workers=(num_workers_to_use > 0)
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=num_workers_to_use,
+        pin_memory=(device.type == 'cuda'),
+        persistent_workers=(num_workers_to_use > 0)
+    )
+
+    # 3. Initialize Model, Losses, and Optimizer
+   
+    # --- Create model structure first ---
+    model = ChessCNN(num_policy_outputs=NUM_POLICY_OUTPUTS).to(device)
+
+    # --- Load pre-existing model if it exists ---
+    if os.path.exists(MODEL_SAVE_PATH):
+        print(f"Found existing model at {MODEL_SAVE_PATH}. Loading weights...")
+        try:
+            # Load the state_dict, mapping to the correct device
+            model.load_state_dict(torch.load(MODEL_SAVE_PATH, map_location=device))
+            print("Model weights loaded successfully.")
+        except Exception as e:
+            print(f"Error loading model weights: {e}")
+            print("Continuing with a new, un-trained model.")
+    else:
+        print(f"No model found at {MODEL_SAVE_PATH}. Creating a new model.")
+    # --- End of new logic ---
+
+    value_loss_fn = nn.MSELoss()
+    policy_loss_fn = nn.CrossEntropyLoss()
+
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
+    print(f"Starting training for {NUM_EPOCHS} epochs...")
+
+    # 4. Training Loop
     for epoch in range(NUM_EPOCHS):
-        print(f"--- Epoch {epoch+1}/{NUM_EPOCHS} ---")
-        train(train_dataloader, model, value_loss_fn, policy_loss_fn, optimizer)
-        test(test_dataloader, model, value_loss_fn, policy_loss_fn)
-    print("Done!")
+        model.train()
+        total_train_loss_v = 0.0
+        total_train_loss_p = 0.0
+        total_correct_p = 0
+        total_samples_p = 0
+
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} [Train]")
+        for boards, values, policies in progress_bar:
+            boards = boards.to(device)
+            values = values.to(device)
+            policies = policies.to(device)
+
+            optimizer.zero_grad()
+            pred_values, pred_policy_logits = model(boards)
+
+            # Ensure value prediction shape matches target
+            pred_values = pred_values.view_as(values)
+
+            loss_v = value_loss_fn(pred_values, values)
+            loss_p = policy_loss_fn(pred_policy_logits, policies)
+
+            # Compute L1 penalty efficiently
+            l1_norm = 0.0
+            for param in model.parameters():
+                l1_norm += torch.abs(param).sum()
+
+            total_loss = loss_v + loss_p + (L1_LAMBDA * l1_norm)
+
+            total_loss.backward()
+            optimizer.step()
+
+            total_train_loss_v += loss_v.item()
+            total_train_loss_p += loss_p.item()
+
+            _, pred_indices = torch.max(pred_policy_logits, 1)
+            total_correct_p += (pred_indices == policies).sum().item()
+            total_samples_p += policies.size(0)
+
+            progress_bar.set_postfix(v_loss=f"{loss_v.item():.4f}", p_loss=f"{loss_p.item():.4f}")
+
+        # --- Validation ---
+        model.eval()
+        total_val_loss_v = 0.0
+        total_val_loss_p = 0.0
+        total_val_correct = 0
+        total_val_samples = 0
+
+        with torch.no_grad():
+            for boards, values, policies in tqdm(val_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS} [Val]"):
+                boards = boards.to(device)
+                values = values.to(device)
+                policies = policies.to(device)
+
+                pred_values, pred_policy_logits = model(boards)
+                pred_values = pred_values.view_as(values)
+
+                loss_v = value_loss_fn(pred_values, values)
+                loss_p = policy_loss_fn(pred_policy_logits, policies)
+
+                total_val_loss_v += loss_v.item()
+                total_val_loss_p += loss_p.item()
+
+                _, pred_indices = torch.max(pred_policy_logits, 1)
+                total_val_correct += (pred_indices == policies).sum().item()
+                total_val_samples += policies.size(0)
+
+        # --- Epoch Summary ---
+        avg_train_loss_v = total_train_loss_v / len(train_loader)
+        avg_train_loss_p = total_train_loss_p / len(train_loader)
+        avg_train_acc_p = total_correct_p / total_samples_p
+
+        avg_val_loss_v = total_val_loss_v / len(val_loader)
+        avg_val_loss_p = total_val_loss_p / len(val_loader)
+        avg_val_acc_p = total_val_correct / total_val_samples
+
+        print(f"\n--- Epoch {epoch+1} Summary ---")
+        print(f"  [Train] Value Loss: {avg_train_loss_v:.4f} | Policy Loss: {avg_train_loss_p:.4f} | Policy Acc: {avg_train_acc_p*100:.2f}%")
+        print(f"  [Val]   Value Loss: {avg_val_loss_v:.4f} | Policy Loss: {avg_val_loss_p:.4f} | Policy Acc: {avg_val_acc_p*100:.2f}%")
+        print("-" * (30 + len(str(epoch+1))))
+
+    # 5. Save the trained model
+    print(f"Training complete. Saving model to {MODEL_SAVE_PATH}")
+    # Save the model's state_dict, which is the recommended way
+    torch.save(model.state_dict(), MODEL_SAVE_PATH)
+
+    # Save the move map as well
+    # Updated this line to correctly replace .pth
+    map_save_path = MODEL_SAVE_PATH.replace(".pth", "_move_map.pkl")
+    with open(map_save_path, 'wb') as f:
+        pickle.dump({'MOVE_TO_INDEX': MOVE_TO_INDEX, 'INDEX_TO_MOVE': INDEX_TO_MOVE}, f)
+    print(f"Saved move mapping to {map_save_path}")
 
 if __name__ == "__main__":
-    main()
+    main() 
