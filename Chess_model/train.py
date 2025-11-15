@@ -230,10 +230,10 @@ def main():
         print(f"  [Val]   Value Loss: {avg_val_loss_v:.4f} | Policy Loss: {avg_val_loss_p:.4f} | Policy Acc: {avg_val_acc_p*100:.2f}%")
         print("-" * (30 + len(str(epoch+1))))
 
-    # 5. Save the trained model
-    print(f"Training complete. Saving model to {MODEL_SAVE_PATH}")
-    # Save the model's state_dict, which is the recommended way
-    torch.save(model.state_dict(), MODEL_SAVE_PATH)
+        # 5. Save the trained model
+        print(f"Training complete. Saving model to {MODEL_SAVE_PATH}")
+        # Save the model's state_dict, which is the recommended way
+        torch.save(model.state_dict(), MODEL_SAVE_PATH)
 
     # Save the move map as well
     # Updated this line to correctly replace .pth
