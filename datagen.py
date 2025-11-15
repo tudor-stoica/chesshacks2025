@@ -1,7 +1,7 @@
 import chess
 import chess.engine
 import numpy as np
-import matplotlib.pyplot as plt
+# import matplotlib.pyplot as plt  <-- REMOVED
 import random
 from tqdm import tqdm
 import os
@@ -9,12 +9,11 @@ import sys
 import pickle
 import multiprocessing
 import functools
-import collections  # <-- Added for policy distribution counting
 
 # --- CONFIGURATION ---
 STOCKFISH_PATH = r"stockfish"
 # --- REDUCED FOR A FAST TEST ---
-NUM_GAMES = 10000
+NUM_GAMES = 1000
 RANDOM_MOVE_PROB = 0.15
 STOCKFISH_TIME_LIMIT_MS = 10 
 EVAL_SCALE_FACTOR = 410.0
@@ -84,9 +83,6 @@ def in_sample(position_data: tuple, filter_func=None) -> bool:
     if filter_func is None: return True
     else: return filter_func(position_data)
 
-# ######################################################################
-# ################ THIS IS THE CORRECTED FUNCTION ######################
-# ######################################################################
 def play_game_worker(game_index, existing_fens_set, random_prob, time_limit_ms, stockfish_path):
     
     # --- ADDED THIS LINE FOR VERIFICATION ---
@@ -165,9 +161,6 @@ def play_game_worker(game_index, existing_fens_set, random_prob, time_limit_ms, 
         if engine: engine.quit()
             
     return new_positions_found
-# ######################################################################
-# ######################################################################
-# ######################################################################
 
 def run_playouts(num_games: int, random_prob: float, existing_fens_set: set, num_workers: int) -> (dict, int):
     print(f"Running {num_games} new playouts in parallel on {num_workers} cores...")
@@ -216,59 +209,6 @@ def process_data(raw_positions_dict: dict, num_workers: int) -> list:
     training_data = [result for result in results_list if result is not None]
     print(f"\nSuccessfully processed {len(training_data)} positions.")
     return training_data
-
-def plot_value_distribution(training_data: list, title_suffix=""):
-    print(f"Generating value distribution plot ({title_suffix})...")
-    values = [data[1] for data in training_data] 
-    if not values:
-        print("No data to plot.")
-        return
-    plt.figure(figsize=(10, 6))
-    bins = np.linspace(0.0, 1.0, 21) 
-    plt.hist(values, bins=bins, edgecolor='black', alpha=0.7)
-    plt.title(f'Distribution of Position Values {title_suffix} (n={len(values)})')
-    plt.xlabel('Position Value (Win Probability, 0.0 to 1.0)')
-    plt.ylabel('Frequency (Number of Positions)')
-    plt.xticks(np.linspace(0.0, 1.0, 11), rotation=45)
-    plt.grid(axis='y', linestyle='--', alpha=0.7)
-    plt.tight_layout()
-    plot_filename = f"value_distribution{title_suffix.replace(' ', '_')}.png"
-    plt.savefig(plot_filename)
-    # plt.show() # Don't block script
-    print(f"Saved value distribution plot to {plot_filename}")
-
-# --- NEW FUNCTION TO PLOT POLICY (MOVE) DISTRIBUTION ---
-def plot_policy_distribution(training_data: list, title_suffix="", top_n=50):
-    """Generates a bar plot for the top N most frequent moves."""
-    print(f"Generating policy (move) distribution plot ({title_suffix})...")
-    moves = [data[2] for data in training_data if data[2] != "GAME_END"] 
-    if not moves:
-        print("No move data to plot.")
-        return
-        
-    move_counts = collections.Counter(moves)
-    common_moves = move_counts.most_common(top_n)
-    
-    if not common_moves:
-        print("No common moves found to plot.")
-        return
-        
-    labels = [move for move, count in common_moves]
-    counts = [count for move, count in common_moves]
-    
-    plt.figure(figsize=(15, 7))
-    plt.bar(labels, counts, color='skyblue', edgecolor='black')
-    plt.title(f'Distribution of Top {top_n} Moves {title_suffix} (Total Moves: {len(moves)})')
-    plt.xlabel('Move (UCI)')
-    plt.ylabel('Frequency (Number of Positions)')
-    plt.xticks(rotation=90)
-    plt.grid(axis='y', linestyle='--', alpha=0.7)
-    plt.tight_layout()
-    
-    plot_filename = f"policy_distribution{title_suffix.replace(' ', '_')}.png"
-    plt.savefig(plot_filename)
-    print(f"Saved policy distribution plot to {plot_filename}")
-# --- END NEW FUNCTION ---
 
 def load_raw_db(filename: str) -> dict:
     if os.path.exists(filename):
@@ -451,7 +391,7 @@ def main():
             
             if value_uniform_data:
                 save_processed_data(VALUE_UNIFORM_TRAIN_FILE, value_uniform_data)
-                plot_value_distribution(value_uniform_data, title_suffix=" (Value Uniform Training Set)")
+                # plot_value_distribution(value_uniform_data, title_suffix=" (Value Uniform Training Set)") <-- REMOVED
         
         if FORCE_POLICY_UNIFORM:
             # Create a separate policy-uniform dataset from the *original* training data
@@ -460,11 +400,11 @@ def main():
             if policy_uniform_data:
                 save_processed_data(POLICY_UNIFORM_TRAIN_FILE, policy_uniform_data)
                 # Plot the new policy distribution
-                plot_policy_distribution(policy_uniform_data, title_suffix=" (Policy Uniform Training Set)")
+                # plot_policy_distribution(policy_uniform_data, title_suffix=" (Policy Uniform Training Set)") <-- REMOVED
         
         # Plot the original, non-uniform distributions for comparison
-        plot_value_distribution(all_train_data, title_suffix=" (Original Training Set)")
-        plot_policy_distribution(all_train_data, title_suffix=" (Original Training Set)")
+        # plot_value_distribution(all_train_data, title_suffix=" (Original Training Set)") <-- REMOVED
+        # plot_policy_distribution(all_train_data, title_suffix=" (Original Training Set)") <-- REMOVED
         
         # The `if pruned_data:` block has been REMOVED as requested.
         # Pruned data is no longer added to the validation set.
@@ -485,4 +425,40 @@ def main():
 
 if __name__ == "__main__":
     multiprocessing.set_start_method("spawn", force=True)
+
     main()
+    
+    # # --- PROFILING SETUP ---
+    # import cProfile, pstats
+    # import io # To print stats
+    
+    # profiler = cProfile.Profile()
+    # profiler.enable()
+    # # --- END PROFILING SETUP ---
+
+    # print("--- Starting main() under profiler ---")
+    # main() 
+    # print("--- Finished main() ---")
+
+    # # --- PROFILING RESULTS ---
+    # profiler.disable()
+    
+    # print("\n\n" + "="*50)
+    # print("--- PROFILING RESULTS (Main Thread) ---")
+    # print("="*50 + "\n")
+    
+    # # --- Option 1: Print to console ---
+    # s = io.StringIO()
+    # # Sort by cumulative time spent in the function and its sub-functions
+    # stats = pstats.Stats(profiler, stream=s).sort_stats('cumulative')
+    # stats.print_stats(40) # Print top 40 most expensive functions
+    # print(s.getvalue())
+
+    # # --- Option 2: Save for Snakeviz (Recommended) ---
+    # profiler_output_file = 'main_thread.prof'
+    # profiler.dump_stats(profiler_output_file)
+    # print(f"\n--- Profiling data saved to '{profiler_output_file}' ---")
+    # print(f"--- To view, run:  pip install snakeviz  ---")
+    # print(f"--- Then run:      snakeviz {profiler_output_file}     ---")
+    # print("="*50)
+    # --- END PROFILING RESULTS ---

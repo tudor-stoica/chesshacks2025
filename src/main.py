@@ -75,7 +75,7 @@ class ChessCNN(nn.Module):
         v = self.flatten(v) 
         v = F.relu(self.value_fc1(v))
         
-        value_output = torch.tanh(self.value_fc2(v))
+        value_output = torch.sigmoid(self.value_fc2(v))
         # ---------------------------------------------------
         
         # --- 4. Policy Head Path ---
@@ -202,11 +202,6 @@ class MCTS:
             # We need it from the perspective of the player *whose turn it just was*.
             if board.turn == chess.WHITE: # Black just moved
                 value = -value
-        
-        elif board.is_repetition(count=2):
-            is_terminal = True
-            value = 0.0 # Draw by repetition
-            
         else:
             # 2. EXPANSION: If not a terminal node, expand it
             # 3. SIMULATION: Get policy and value from the model
