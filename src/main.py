@@ -22,7 +22,7 @@ def test_func(ctx: GameContext):
 
     legal_moves = list(ctx.board.generate_legal_moves())
 
-    return random.choice(legal_moves)
+    return legal_moves[0]
 
 
 @chess_manager.reset
