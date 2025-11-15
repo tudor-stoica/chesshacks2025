@@ -21,8 +21,15 @@ def test_func(ctx: GameContext):
     time.sleep(0.1)
 
     legal_moves = list(ctx.board.generate_legal_moves())
+    move = random.choice(legal_moves)
 
-    return random.choice(legal_moves)
+    # Uniform probabilities over legal moves
+    p = 1.0 / len(legal_moves)
+    move_probs = {m: p for m in legal_moves}
+
+    logs = ["random move bot"]
+
+    return move, move_probs, logs
 
 
 @chess_manager.reset
