@@ -9,23 +9,27 @@ import sys
 import pickle
 import multiprocessing
 import functools
-import collections
+import collections  # <-- Added for policy distribution counting
 
+# --- CONFIGURATION ---
 STOCKFISH_PATH = r"stockfish"
-NUM_GAMES = 1
+# --- REDUCED FOR A FAST TEST ---
+NUM_GAMES = 10000
 RANDOM_MOVE_PROB = 0.15
 STOCKFISH_TIME_LIMIT_MS = 10 
 EVAL_SCALE_FACTOR = 410.0
-CPU_CORES_TO_USE = os.cpu_count() or 1
-VALIDATION_SPLIT = 0.1
+CPU_CORES_TO_USE = 16
+VALIDATION_SPLIT = 0
 RAW_DB_FILE = 'chess_positions_db.pkl'
 ORIGINAL_TRAIN_FILE = 'chess_training_data_original.pkl'
 VALIDATION_FILE = 'validation.pkl'
 
+# --- UPDATED CONFIG AS PER YOUR REQUEST ---
 FORCE_VALUE_UNIFORM = True  # Renamed from FORCE_UNIFORM
 FORCE_POLICY_UNIFORM = True # New flag for move distribution
 VALUE_UNIFORM_TRAIN_FILE = 'chess_training_data_value_uniform.pkl'
 POLICY_UNIFORM_TRAIN_FILE = 'chess_training_data_policy_uniform.pkl'
+# --- END UPDATED CONFIG ---
 
 MY_PIECES = [chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING]
 OPP_PIECES = [chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING]
@@ -80,6 +84,9 @@ def in_sample(position_data: tuple, filter_func=None) -> bool:
     if filter_func is None: return True
     else: return filter_func(position_data)
 
+# ######################################################################
+# ################ THIS IS THE CORRECTED FUNCTION ######################
+# ######################################################################
 def play_game_worker(game_index, existing_fens_set, random_prob, time_limit_ms, stockfish_path):
     
     # --- ADDED THIS LINE FOR VERIFICATION ---
@@ -158,6 +165,9 @@ def play_game_worker(game_index, existing_fens_set, random_prob, time_limit_ms, 
         if engine: engine.quit()
             
     return new_positions_found
+# ######################################################################
+# ######################################################################
+# ######################################################################
 
 def run_playouts(num_games: int, random_prob: float, existing_fens_set: set, num_workers: int) -> (dict, int):
     print(f"Running {num_games} new playouts in parallel on {num_workers} cores...")
@@ -330,7 +340,9 @@ def create_value_uniform_dataset_by_pruning(training_data: list) -> list:
     print(f"Created value-uniform dataset with {len(uniform_data)} samples (by pruning).")
     # No longer returns pruned_data
     return uniform_data
+# --- END UPDATED FUNCTION ---
 
+# --- NEW FUNCTION FOR POLICY UNIFORMITY ---
 def create_policy_uniform_dataset_by_pruning(training_data: list) -> list:
     """Creates a uniform dataset based on *move* (policy) by pruning all move bins to the minimum bin size."""
     print("Creating uniform *policy* distribution dataset (Pruning to Min Height)...")

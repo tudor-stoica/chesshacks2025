@@ -4,21 +4,18 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import pickle
-import numpy as np
 import os
 from tqdm import tqdm
-from chess_cnn import ChessCNN  # Your custom model
+from chess_cnn import ChessCNN
 
-# --- Configuration ---
 TRAIN_DATA_FILE = '../chess_training_data_value_uniform.pkl'
 VAL_DATA_FILE = '../validation.pkl'
 MODEL_SAVE_PATH = 'chess_cnn.pth'
 NUM_WORKERS = 1
 
-# --- Hyperparameters ---
 BATCH_SIZE = 256
 LEARNING_RATE = 0.001
-NUM_EPOCHS = 50
+NUM_EPOCHS = 10
 L1_LAMBDA = 1e-5
 
 def load_data_and_create_maps(train_file, val_file):
@@ -48,7 +45,6 @@ def load_data_and_create_maps(train_file, val_file):
         exit(1)
     print(f"Loaded {len(val_data)} validation samples.")
 
-    # --- Create a UNIFIED move map ---
     train_moves = set(item[2] for item in train_data)
     val_moves = set(item[2] for item in val_data)
     policy_moves = train_moves | val_moves
