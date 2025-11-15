@@ -1,3 +1,9 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+
+# ResidualBlock (unchanged)
 class ResidualBlock(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, padding=1):
         super().__init__()
@@ -13,7 +19,7 @@ class ResidualBlock(nn.Module):
         out = out + identity
         return F.relu(out)
 
-# Define the "Leaner" model
+# --- Updated ChessCNN Model ---
 class ChessCNN(nn.Module):
     def __init__(self, num_policy_outputs):
         super().__init__()
@@ -21,59 +27,59 @@ class ChessCNN(nn.Module):
         # --- Configuration ---
         self.board_size = 8
         self.half_move_lookback = 0
-        # pieces + castling + en passent sqaure + 50 move clock normilized to (0-1)
         self.in_channels = (12 + 4 + 1 + 1) * (1 + self.half_move_lookback)
         
-        self.num_channels = 100
-        self.num_res_blocks = 8
+        self.num_channels = 256
+        self.num_res_blocks = 10
         head_fc_size = 32
         head_conv_channels = 2
         
         fc1_input_size = head_conv_channels * self.board_size * self.board_size
 
-        # --- 1. Initial Convolutional Layer ---
+        # --- 1. Initial Convolutional Layer (Shared Body) ---
         self.conv_in = nn.Conv2d(self.in_channels, self.num_channels, kernel_size=3, padding=1)
         self.bn_in = nn.BatchNorm2d(self.num_channels)
 
-        # --- 2. Residual Stack ---
+        # --- 2. Residual Stack (Shared Body) ---
         self.res_stack = nn.ModuleList([ResidualBlock(self.num_channels, self.num_channels) for _ in range(self.num_res_blocks)])
         
-        self.flatten = nn.Flatten()
-        
-        # --- 3. The "Value Head" ---
-        def value_head():
-            self.value_conv = nn.Conv2d(self.num_channels, head_conv_channels, kernel_size=1)
-            self.value_bn = nn.BatchNorm2d(head_conv_channels)
-            self.value_fc1 = nn.Linear(fc1_input_size, head_fc_size)
-            self.value_fc2 = nn.Linear(head_fc_size, 1) # Final output neuron
+        # --- 3. The "Value Head" (Grouped into nn.Sequential) ---
+        self.value_head = nn.Sequential(
+            nn.Conv2d(self.num_channels, head_conv_channels, kernel_size=1),
+            nn.BatchNorm2d(head_conv_channels),
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(fc1_input_size, head_fc_size),
+            nn.ReLU(),
+            nn.Linear(head_fc_size, 1) # Final output neuron
+        )
 
-        # --- 4. The "Policy Head" ---
-        def policy_head():
-            self.policy_conv = nn.Conv2d(self.num_channels, head_conv_channels, kernel_size=1)
-            self.policy_bn = nn.BatchNorm2d(head_conv_channels)
-            self.policy_fc1 = nn.Linear(fc1_input_size, num_policy_outputs)
+        # --- 4. The "Policy Head" (Grouped into nn.Sequential) ---
+        self.policy_head = nn.Sequential(
+            nn.Conv2d(self.num_channels, head_conv_channels, kernel_size=1),
+            nn.BatchNorm2d(head_conv_channels),
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(fc1_input_size, num_policy_outputs)
+        )
 
     def forward(self, x):
-        # 1. Initial layer
+        # 1. Initial layer (Body)
         x = F.relu(self.bn_in(self.conv_in(x)))
         
-        # 2. Pass through all residual blocks
+        # 2. Pass through all residual blocks (Body)
         for block in self.res_stack:
             x = block(x)
             
         # --- 3. Value Head Path ---
-        v = F.relu(self.value_bn(self.value_conv(x)))
-        v = self.flatten(v) 
-        v = F.relu(self.value_fc1(v))
+        # Pass the shared "body" output 'x' to the value head
+        value_output = self.value_head(x)
         
-        # --- MODIFICATION: Output raw logits ---
-        value_logits = F.sigmoid(self.value_fc2(v))
-        # -------------------------------------
+        # Apply final activation (as in your original code)
+        value_logits = F.sigmoid(value_output)
         
         # --- 4. Policy Head Path ---
-        p = F.relu(self.policy_bn(self.policy_conv(x)))
-        p = self.flatten(p)
-        policy_logits = self.policy_fc1(p)
+        # Pass the *same* shared "body" output 'x' to the policy head
+        policy_logits = self.policy_head(x)
         
-        # Return the LOGITS for the value head
         return value_logits, policy_logits
