@@ -6,6 +6,8 @@ import time
 # Write code here that runs once
 # Can do things like load models from huggingface, make connections to subprocesses, etcwenis
 
+def get_model_policy():
+    
 
 @chess_manager.entrypoint
 def test_func(ctx: GameContext):
@@ -21,7 +23,7 @@ def test_func(ctx: GameContext):
         ctx.logProbabilities({})
         raise ValueError("No legal moves available (i probably lost didn't i)")
 
-    move_weights = [random.random() for _ in legal_moves]
+    move_weights = 
     total_weight = sum(move_weights)
     # Normalize so probabilities sum to 1
     move_probs = {
