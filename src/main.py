@@ -249,11 +249,9 @@ class MCTS:
         # Now `current_node` is a leaf, and `board` is the state at that leaf.
         
         value = 0.0
-        is_terminal = False
 
         # Check if the game is over at this leaf
         if board.is_game_over():
-            is_terminal = True
             result = board.result()
             if result == "1-0":
                 value = 1.0  # White won
@@ -262,25 +260,12 @@ class MCTS:
             else:
                 value = 0.0  # Draw
             
-            # --- CRITICAL FIX: ALIGN TERMINAL VALUE ---
-            # The `value` (1.0, -1.0, 0.0) is from White's perspective.
-            # We MUST convert it to the perspective of the player *whose turn it is*
-            # (board.turn), to match the convention used by the neural network.
             if board.turn == chess.BLACK:
                 value = -value
-            # -------------------------------------------
 
         else:
-            # 2. EXPANSION: If not a terminal node, expand it
-            # 3. SIMULATION: Get policy and value from the model
-            
-            # --- MODIFIED: Apply Dirichlet Noise at root ---
-            
-            # Check if we are expanding the root node
             is_root_expansion = (current_node.parent is None)
             
-            # `model` returns value from the perspective of the *current* player
-            # This value is already in the [-1, 1] range thanks to our wrapper.
             policy_dict_uci, value = self.model(board)
             
             legal_moves = list(board.legal_moves)
@@ -299,9 +284,6 @@ class MCTS:
                 if move not in current_node.children:
                     current_node.children[move] = Node(parent=current_node, move=move, prior_p=move_prob)
 
-        # 4. BACKPROPAGATION: Update statistics up the tree
-        # `value` is now correct, either from the model or from the fixed terminal
-        # logic. It is from the perspective of the player at `board.turn`.
         temp_node = current_node
         while temp_node is not None:
             temp_node.N += 1
