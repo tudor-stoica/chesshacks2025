@@ -8,7 +8,31 @@ import pickle
 import numpy as np
 import os
 
-from .utils import chess_manager, GameContext
+# Assuming 'utils' is a module in the same package or directory
+# If not, these might need to be defined or imported differently
+try:
+    from .utils import chess_manager, GameContext
+except ImportError:
+    # Fallback for running as a standalone script
+    print("Could not import from .utils, using placeholder classes.")
+    
+    class ChessManager:
+        def entrypoint(self, func):
+            self._entrypoint = func
+            return func
+        
+        def reset(self, func):
+            self._reset = func
+            return func
+            
+    chess_manager = ChessManager()
+    
+    class GameContext:
+        def __init__(self, board):
+            self.board = board
+            # Add other fields as needed, e.g., time_remaining_ms
+            self.time_remaining_ms = 300000 
+
 
 # A helper class for a single Residual Block
 class ResidualBlock(nn.Module):
@@ -75,6 +99,9 @@ class ChessCNN(nn.Module):
         v = self.flatten(v) 
         v = F.relu(self.value_fc1(v))
         
+        # --- UNCHANGED (as requested) ---
+        # Output remains [0, 1] as requested by user.
+        # We will convert this in the _model_wrapper.
         value_output = torch.sigmoid(self.value_fc2(v))
         # ---------------------------------------------------
         
@@ -83,7 +110,7 @@ class ChessCNN(nn.Module):
         p = self.flatten(p)
         policy_logits = self.policy_fc1(p)
         
-        # Return the [-1, 1] value and policy logits
+        # Return the [0, 1] value and policy logits
         return value_output, policy_logits
 
 PIECES = [chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING]
@@ -120,15 +147,20 @@ class MCTS:
     """
     The main MCTS class.
     """
-    def __init__(self, model, c_puct=1.41):
+    def __init__(self, model, c_puct=2, dirichlet_alpha=0.3, dirichlet_epsilon=0.25):
         """
         :param model: A function that takes a chess.Board and returns (policy, value).
                       - policy: A dictionary mapping move.uci() string to probability.
                       - value: A float from -1 (loss) to +1 (win) for the current player.
         :param c_puct: The exploration constant (controls trade-off between exploitation and exploration).
+        :param dirichlet_alpha: Alpha parameter for Dirichlet noise.
+        :param dirichlet_epsilon: Epsilon (weight) for Dirichlet noise.
         """
         self.model = model
         self.c_puct = c_puct
+        # --- NEW: Store Dirichlet parameters ---
+        self.dirichlet_alpha = dirichlet_alpha
+        self.dirichlet_epsilon = dirichlet_epsilon
 
     def select_best_move(self, root):
         """
@@ -153,18 +185,50 @@ class MCTS:
         
         start_time = time.time()
         
+        simulations= 0
         # Main MCTS loop
         while time.time() - start_time < timelimit:
             # We create a copy of the board for each simulation
             # to avoid modifying the original
             board_sim = root_board.copy()
             
+            simulations += 1
             # Run one simulation (select, expand, backpropagate)
             self.run_simulation(root, board_sim)
             
         # After the time is up, select the best move
-        return self.select_best_move(root)
+        best_move = self.select_best_move(root)
+        
+        # --- MODIFIED: Return the root node as well ---
+        return best_move, root
 
+    # --- NEW: Helper for Dirichlet Noise ---
+    def add_dirichlet_noise(self, policy_dict_uci, legal_moves):
+        """
+        Applies Dirichlet noise to the policy probabilities for exploration.
+        """
+        legal_moves_uci = [m.uci() for m in legal_moves]
+        
+        # Generate noise
+        num_legal = len(legal_moves_uci)
+        if num_legal <= 1:
+            return # No noise needed for 0 or 1 moves
+
+        noise = np.random.dirichlet([self.dirichlet_alpha] * num_legal)
+        
+        # Apply noise
+        for i, move_uci in enumerate(legal_moves_uci):
+            if move_uci in policy_dict_uci:
+                policy_dict_uci[move_uci] = (1 - self.dirichlet_epsilon) * policy_dict_uci[move_uci] + \
+                                            self.dirichlet_epsilon * noise[i]
+        
+        # Renormalize to ensure probabilities sum to 1 (optional, but good practice)
+        total_prob = sum(policy_dict_uci.get(m_uci, 0.0) for m_uci in legal_moves_uci)
+        if total_prob > 0:
+            for m_uci in legal_moves_uci:
+                if m_uci in policy_dict_uci:
+                    policy_dict_uci[m_uci] /= total_prob
+        
     def run_simulation(self, node, board):
         """
         Performs one simulation from the given node.
@@ -198,18 +262,33 @@ class MCTS:
             else:
                 value = 0.0  # Draw
             
-            # The value is from the perspective of WHITE.
-            # We need it from the perspective of the player *whose turn it just was*.
-            if board.turn == chess.WHITE: # Black just moved
+            # --- CRITICAL FIX: ALIGN TERMINAL VALUE ---
+            # The `value` (1.0, -1.0, 0.0) is from White's perspective.
+            # We MUST convert it to the perspective of the player *whose turn it is*
+            # (board.turn), to match the convention used by the neural network.
+            if board.turn == chess.BLACK:
                 value = -value
+            # -------------------------------------------
+
         else:
             # 2. EXPANSION: If not a terminal node, expand it
             # 3. SIMULATION: Get policy and value from the model
             
+            # --- MODIFIED: Apply Dirichlet Noise at root ---
+            
+            # Check if we are expanding the root node
+            is_root_expansion = (current_node.parent is None)
+            
             # `model` returns value from the perspective of the *current* player
+            # This value is already in the [-1, 1] range thanks to our wrapper.
             policy_dict_uci, value = self.model(board)
             
             legal_moves = list(board.legal_moves)
+            
+            # Apply Dirichlet Noise if this is the root
+            if is_root_expansion:
+                self.add_dirichlet_noise(policy_dict_uci, legal_moves)
+            # --------------------------------------------------------
             
             # Create child nodes for all legal moves
             for move in legal_moves:
@@ -221,9 +300,13 @@ class MCTS:
                     current_node.children[move] = Node(parent=current_node, move=move, prior_p=move_prob)
 
         # 4. BACKPROPAGATION: Update statistics up the tree
+        # `value` is now correct, either from the model or from the fixed terminal
+        # logic. It is from the perspective of the player at `board.turn`.
         temp_node = current_node
         while temp_node is not None:
             temp_node.N += 1
+            # `value` is from the perspective of the player-to-move at the
+            # child node. We must flip it for the parent.
             temp_node.Q += value
             # The value flips for the parent (opponent's perspective)
             value = -value
@@ -296,8 +379,13 @@ def convert_board_to_tensor(board: chess.Board, repetition_plane_value: float) -
     if board.has_queenside_castling_rights(chess.WHITE): tensor[13, :, :] = 1.0
     if board.has_kingside_castling_rights(chess.BLACK): tensor[14, :, :] = 1.0
     if board.has_queenside_castling_rights(chess.BLACK): tensor[15, :, :] = 1.0
+    
     ep_sq = board.ep_square
-    if ep_sq: tensor[16, chess.square_rank(ep_sq), chess.square_file(sq)] = 1.0
+    if ep_sq:
+        # --- FIXED: En Passant Bug ---
+        # Was using `sq` from previous loop by mistake
+        tensor[16, chess.square_rank(ep_sq), chess.square_file(ep_sq)] = 1.0
+    
     tensor[17, :, :] = repetition_plane_value
     tensor[18, :, :] = board.halfmove_clock / 100.0
     return tensor
@@ -323,15 +411,21 @@ def _model_wrapper(board: chess.Board) -> tuple[dict[str, float], float]:
     # 2. Model inference
     with torch.no_grad():
         # Model returns (value_output, policy_logits)
-        # value_output is already in the [-1, 1] range (due to tanh)
-        value_output, policy_logits = g_model(tensor_torch)
+        # value_output is in the [0, 1] range (due to sigmoid)
+        value_output_sigmoid, policy_logits = g_model(tensor_torch)
 
     # 3. Post-processing
     
     # --- Process Value ---
-    # The model now directly outputs the value in the [-1, 1] range.
-    # No conversion is needed.
-    value = value_output.item()
+    # --- CRITICAL FIX: Convert [0, 1] sigmoid to [-1, 1] negamax range ---
+    # This scales the [0, 1] output to the [-1, 1] range
+    # 0.0 -> -1.0 (loss)
+    # 0.5 ->  0.0 (draw)
+    # 1.0 -> +1.0 (win)
+    # This allows the MCTS's `value = -value` logic to work correctly.
+    value_sigmoid = value_output_sigmoid.item()
+    value_negamax = (value_sigmoid * 2.0) - 1.0
+    # --------------------------------------------------------------------
 
     # --- Process Policy ---
     # The model outputs raw logits. We apply softmax to get probabilities.
@@ -344,7 +438,8 @@ def _model_wrapper(board: chess.Board) -> tuple[dict[str, float], float]:
         for i, move_uci in enumerate(g_move_map)
     }
 
-    return policy_dict_uci, value
+    # Return the NEGMAX value
+    return policy_dict_uci, value_negamax
 
 # --- Updated Entrypoint ---
 
@@ -365,16 +460,47 @@ def test_func(ctx: GameContext):
     # Get the current board state from the context
     board = ctx.board
     
-    # Set a time limit for the search (e.g., 2 seconds)
+    # Set a time limit for the search (e.g., 3 seconds)
     # In a real system, you might get this from the context (e.g., ctx.time_remaining_ms)
-    time_limit_sec = 2.0
+    time_limit_sec = 3.0
     print(f"Starting MCTS search for {time_limit_sec} seconds...")
     
     # Run the MCTS search
     # We pass a copy of the board to be safe
-    best_move = g_mcts.search(board.copy(), timelimit=time_limit_sec)
+    # --- MODIFIED: Receive the 'root_node' back from search ---
+    best_move, root_node = g_mcts.search(board.copy(), timelimit=time_limit_sec)
     
     print(f"MCTS search complete. Best move: {best_move.uci()}")
+    
+    # --- NEW: Print statistics for all child moves ---
+    print("\n--- Move Statistics (Simulations) ---")
+    
+    # Get a list of (move_uci, visit_count, avg_value) tuples
+    move_stats = []
+    if root_node and root_node.N > 0: # Avoid division by zero if no sims ran
+        for move, child_node in root_node.children.items():
+            if child_node.N > 0:
+                # child.get_value() is value from child's perspective (opponent)
+                # We negate it to get the value for the current player
+                avg_value = -child_node.get_value() 
+                move_stats.append((move.uci(), child_node.N, avg_value))
+                
+        # Sort by visit count (most simulations first)
+        move_stats.sort(key=lambda item: item[1], reverse=True)
+        
+        # Print the sorted list
+        total_sims = root_node.N
+        print(f"Total simulations from root: {total_sims}")
+        print(f"{'Move':<10} | {'Visits':<10} | {'Percentage':<12} | {'Value (for me)':<15}")
+        print("-" * 52) # Adjusted width
+        for move_uci, n, val in move_stats:
+            percentage = (n / total_sims) * 100
+            print(f"{move_uci:<10} | {n:<10} | {percentage:11.2f}% | {val:14.4f}")
+    else:
+        print("No simulations were run or root node is invalid.")
+    # -------------------------------------------------
+    
+    print("\n") # Add a newline for cleaner logs
     
     # Return the best move found by the search
     return best_move
@@ -434,8 +560,12 @@ def reset_func(ctx: GameContext):
     g_model.eval()
     
     # 6. Initialize the MCTS
-    # Pass our _model_wrapper function to the MCTS
-    g_mcts = MCTS(model=_model_wrapper, c_puct=1.41)
+    # --- MODIFIED: Pass Dirichlet noise parameters ---
+    # `c_puct=1.41` (sqrt(2)) is a common value
+    g_mcts = MCTS(model=_model_wrapper, 
+                  c_puct=1.41, 
+                  dirichlet_alpha=0.3, 
+                  dirichlet_epsilon=0.25)
     
     print("--- Model and MCTS initialized successfully ---")
 
@@ -456,7 +586,8 @@ if __name__ == "__main__":
         print(test_ctx.board)
         
         # 3. Ask for the first move
-        move1 = test_func(test_ctx)
+        # Use the entrypoint function directly
+        move1 = chess_manager._entrypoint(test_ctx)
         test_ctx.board.push(move1)
         print(f"\nAI moved: {move1.uci()}")
         print(test_ctx.board)
@@ -469,7 +600,8 @@ if __name__ == "__main__":
             print(test_ctx.board)
             
             # 5. Ask for the second AI move
-            move2 = test_func(test_ctx)
+            # Use the entrypoint function directly
+            move2 = chess_manager._entrypoint(test_ctx)
             test_ctx.board.push(move2)
             print(f"\nAI moved: {move2.uci()}")
             print(test_ctx.board)
