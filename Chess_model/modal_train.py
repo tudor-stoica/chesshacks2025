@@ -1,7 +1,7 @@
 import os
 import modal
 
-VOLUME_NAME = "chess-data-volume"
+VOLUME_NAME = "my-chess-data"
 DATA_MOUNT_PATH = "/data"
 
 image = (
@@ -27,7 +27,7 @@ data_volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 @app.function(
     image=image,
     # remove gpu=... if you want CPU-only
-    gpu="A100-40GB",
+    gpu="A10",
     timeout=60 * 60 * 12,
     volumes={DATA_MOUNT_PATH: data_volume},
 )
@@ -50,11 +50,11 @@ def train_remote(
     import train as tr
 
     # Point train.py's paths to the Volume (where your .pkl files live)
-    tr.TRAIN_DATA_FILE = f"{DATA_MOUNT_PATH}/data/chess_training_data_value_uniform.pkl"
-    tr.VAL_DATA_FILE   = f"{DATA_MOUNT_PATH}/data/validation.pkl"
+    tr.TRAIN_DATA_FILE = f"{DATA_MOUNT_PATH}/chess_training_data_value_uniform.pkl"
+    tr.VAL_DATA_FILE   = f"{DATA_MOUNT_PATH}/validation.pkl"
 
     # Save model into the Volume so you can download it later
-    tr.MODEL_SAVE_PATH = f"{DATA_MOUNT_PATH}/chess_cnn1.pth"
+    tr.MODEL_SAVE_PATH = f"{DATA_MOUNT_PATH}/chess_cnn.pth"
 
     # Override hyperparameters without editing train.py
     tr.NUM_EPOCHS  = num_epochs

@@ -463,6 +463,48 @@ def _model_wrapper(board: chess.Board) -> tuple[dict[str, float], float]:
     # Return the NEGMAX value
     return policy_dict_uci, value_negamax
 
+
+def compute_bullet_time_limit_sec(board: chess.Board, timeLeft: float) -> float:
+    # 1. Handle missing/zero time
+    if timeLeft <= 0:
+        return 0.02  # panic move
+
+    # 2. Guess units: seconds (<= 600) vs ms (>= 1000)
+    if timeLeft > 1000:
+        total_time_s = timeLeft / 1000.0
+    else:
+        total_time_s = timeLeft
+
+    # 3. Reserve: keep ~20% of time or at least 3s
+    reserve_s = max(3.0, 0.2 * total_time_s)
+    usable_time_s = max(0.0, total_time_s - reserve_s)
+    if usable_time_s <= 0.0:
+        return 0.02
+
+    # 4. Estimate moves left from phase
+    move_number = board.fullmove_number
+    if move_number < 10:
+        est_moves_left = 40
+    elif move_number < 20:
+        est_moves_left = 25
+    else:
+        est_moves_left = 15
+
+    base_time_per_move = usable_time_s / est_moves_left
+    AGGRESSION = 1.05
+    raw_allocation = base_time_per_move * AGGRESSION
+
+    # 5. Dynamic min/max
+    MIN_TIME_PER_MOVE = 0.02
+    # at most 12% of total remaining time, no hard 0.35s clamp
+    MAX_TIME_PER_MOVE = max(0.10 * total_time_s, 0.08)  
+
+    allocation_s = max(MIN_TIME_PER_MOVE, min(raw_allocation, MAX_TIME_PER_MOVE))
+
+    SAFETY_MULT = 0.9
+    return allocation_s * SAFETY_MULT
+
+
 # --- Updated Entrypoint ---
 
 @chess_manager.entrypoint
@@ -495,29 +537,15 @@ def test_func(ctx: GameContext):
                     for move_uci in legal_moves_uci]
     legal_policy.sort(key=lambda x: x[1], reverse=True)
     
-    # Display base value
-    
-    
-    # Display top moves from base policy
-    
-    
-
-    
-    # ------------------------------------------------
-    
     # Set a time limit for the search (e.g., 3 seconds)
     # In a real system, you might get this from the context (e.g., ctx.time_remaining_ms)
-    time_limit_sec = 1
+    time_limit_sec = compute_bullet_time_limit_sec(board, ctx.timeLeft)
     
     
     # Run the MCTS search
     # We pass a copy of the board to be safe
     # --- MODIFIED: Receive the 'root_node' back from search ---
     best_move, root_node = g_mcts.search(board.copy(), timelimit=time_limit_sec)
-    
-    
-    
-    # --- NEW: 
     
     
     # Get a list of (move_uci, visit_count, avg_value) tuples
@@ -532,18 +560,6 @@ def test_func(ctx: GameContext):
                 
         # Sort by visit count (most simulations first)
         move_stats.sort(key=lambda item: item[1], reverse=True)
-        
-        # 
-        total_sims = root_node.N
-        
-        
-        
-        for move_uci, n, val in move_stats:
-            percentage = (n / total_sims) * 100
-  
-    # -------------------------------------------------
-    
-    
     
     # Return the best move found by the search
     return best_move
@@ -609,42 +625,5 @@ def reset_func(ctx: GameContext):
                   c_puct=1.20, 
                   dirichlet_alpha=0.3, 
                   dirichlet_epsilon=0.25)
-    
-    
 
-# --- Example of how to run (if this script is executed directly) ---
-if __name__ == "__main__":
-    
-    
-    # Create a dummy context and board
-    test_board = chess.Board()
-    test_ctx = GameContext(board=test_board)
-    
-    # 1. Call reset to load models (this happens automatically in the real env)
-    reset_func(test_ctx)
-    
-    # 2. Check if loading was successful
-    if g_mcts:
-        
-        
-        
-        # 3. Ask for the first move
-        # Use the entrypoint function directly
-        move1 = chess_manager._entrypoint(test_ctx)
-        test_ctx.board.push(move1)
-        
-        
-        
-        # 4. Make a simple opponent move
-        opponent_move = chess.Move.from_uci("e7e6") # A simple pawn move
-        if opponent_move in test_ctx.board.legal_moves:
-            test_ctx.board.push(opponent_move)
-            
-            
-            
-            # 5. Ask for the second AI move
-            # Use the entrypoint function directly
-            move2 = chess_manager._entrypoint(test_ctx)
-            test_ctx.board.push(move2)
-            
         
