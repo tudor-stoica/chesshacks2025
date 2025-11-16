@@ -507,7 +507,7 @@ def test_func(ctx: GameContext):
     
     # Set a time limit for the search (e.g., 3 seconds)
     # In a real system, you might get this from the context (e.g., ctx.time_remaining_ms)
-    time_limit_sec = 0.1
+    time_limit_sec = 1
     
     
     # Run the MCTS search
@@ -606,7 +606,7 @@ def reset_func(ctx: GameContext):
     # --- MODIFIED: Pass Dirichlet noise parameters ---
     # `c_puct=1.41` (sqrt(2)) is a common value
     g_mcts = MCTS(model=_model_wrapper, 
-                  c_puct=1.41, 
+                  c_puct=1.20, 
                   dirichlet_alpha=0.3, 
                   dirichlet_epsilon=0.25)
     
