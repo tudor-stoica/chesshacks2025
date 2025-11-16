@@ -351,12 +351,20 @@ PIECE_TO_CHANNEL = {
 
 def convert_board_to_tensor(board: chess.Board, repetition_plane_value: float) -> np.ndarray:
     tensor = np.zeros((19, 8, 8), dtype=np.float32)
-    for i, piece_type in enumerate(PIECES):
-        for sq in board.pieces(piece_type, chess.WHITE):
-            tensor[i, chess.square_rank(sq), chess.square_file(sq)] = 1.0
-    for i, piece_type in enumerate(PIECES):
-        for sq in board.pieces(piece_type, chess.BLACK):
-            tensor[i + 6, chess.square_rank(sq), chess.square_file(sq)] = 1.0
+    if board.turn == chess.WHITE:
+        for i, piece_type in enumerate(PIECES):
+            for sq in board.pieces(piece_type, chess.WHITE):
+                tensor[i, chess.square_rank(sq), chess.square_file(sq)] = 1.0
+        for i, piece_type in enumerate(PIECES):
+            for sq in board.pieces(piece_type, chess.BLACK):
+                tensor[i + 6, chess.square_rank(sq), chess.square_file(sq)] = 1.0
+    else:
+        for i, piece_type in enumerate(PIECES):
+            for sq in board.pieces(piece_type, chess.BLACK):
+                tensor[i, 7 - chess.square_rank(sq), 7 - chess.square_file(sq)] = 1.0
+        for i, piece_type in enumerate(PIECES):
+            for sq in board.pieces(piece_type, chess.WHITE):
+                tensor[i + 6, 7 - chess.square_rank(sq), 7 - chess.square_file(sq)] = 1.0
     if board.has_kingside_castling_rights(chess.WHITE): tensor[12, :, :] = 1.0
     if board.has_queenside_castling_rights(chess.WHITE): tensor[13, :, :] = 1.0
     if board.has_kingside_castling_rights(chess.BLACK): tensor[14, :, :] = 1.0
