@@ -10,7 +10,6 @@ import os
 
 from .utils import chess_manager, GameContext
 
-
 # A helper class for a single Residual Block
 class ResidualBlock(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, padding=1):
@@ -36,7 +35,7 @@ class ChessCNN(nn.Module):
         self.board_size = 8
         self.in_channels = 19 # 19 planes
         
-        self.num_channels = 256
+        self.num_channels = 128
         self.num_res_blocks = 10
         head_fc_size = 32
         head_conv_channels = 2
@@ -76,19 +75,17 @@ class ChessCNN(nn.Module):
         v = self.flatten(v) 
         v = F.relu(self.value_fc1(v))
         
-        # --- UNCHANGED (as requested) ---
-        # Output remains [0, 1] as requested by user.
-        # We will convert this in the _model_wrapper.
-        value_output = torch.sigmoid(self.value_fc2(v))
-        # ---------------------------------------------------
+        # --- MODIFICATION: Output raw logits ---
+        value_logits = F.sigmoid(self.value_fc2(v))
+        # -------------------------------------
         
         # --- 4. Policy Head Path ---
         p = F.relu(self.policy_bn(self.policy_conv(x)))
         p = self.flatten(p)
         policy_logits = self.policy_fc1(p)
         
-        # Return the [0, 1] value and policy logits
-        return value_output, policy_logits
+        # Return the LOGITS for the value head
+        return value_logits, policy_logits
 
 PIECES = [chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING]
 
@@ -308,8 +305,8 @@ g_move_map = None
 g_device = None
 g_mcts = None
 
-MODEL_FILE = "chess_cnn.pth"
-MAP_FILE = "chess_cnn_move_map.pkl"
+MODEL_FILE = "chess_cnn_fp16.pth"
+MAP_FILE = "chess_cnn_move_map_small.pkl"
 
 PIECE_TO_CHANNEL = {
     (chess.PAWN, chess.WHITE): 0,
