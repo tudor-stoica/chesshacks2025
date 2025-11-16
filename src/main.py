@@ -8,30 +8,7 @@ import pickle
 import numpy as np
 import os
 
-# Assuming 'utils' is a module in the same package or directory
-# If not, these might need to be defined or imported differently
-try:
-    from .utils import chess_manager, GameContext
-except ImportError:
-    # Fallback for running as a standalone script
-    print("Could not import from .utils, using placeholder classes.")
-    
-    class ChessManager:
-        def entrypoint(self, func):
-            self._entrypoint = func
-            return func
-        
-        def reset(self, func):
-            self._reset = func
-            return func
-            
-    chess_manager = ChessManager()
-    
-    class GameContext:
-        def __init__(self, board):
-            self.board = board
-            # Add other fields as needed, e.g., time_remaining_ms
-            self.time_remaining_ms = 300000 
+from .utils import chess_manager, GameContext
 
 
 # A helper class for a single Residual Block
@@ -533,9 +510,7 @@ def test_func(ctx: GameContext):
     
     # Set a time limit for the search (e.g., 3 seconds)
     # In a real system, you might get this from the context (e.g., ctx.time_remaining_ms)
-    if ctx.time_remaining_ms < 1000:
-        time_limit_sec = 0.01
-    time_limit_sec = 1.0
+    time_limit_sec = 0.5
     print(f"\nStarting MCTS search for {time_limit_sec} seconds...")
     
     # Run the MCTS search
