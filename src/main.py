@@ -533,7 +533,9 @@ def test_func(ctx: GameContext):
     
     # Set a time limit for the search (e.g., 3 seconds)
     # In a real system, you might get this from the context (e.g., ctx.time_remaining_ms)
-    time_limit_sec = 3.0
+    if ctx.time_remaining_ms < 1000:
+        time_limit_sec = 0.01
+    time_limit_sec = 1.0
     print(f"\nStarting MCTS search for {time_limit_sec} seconds...")
     
     # Run the MCTS search

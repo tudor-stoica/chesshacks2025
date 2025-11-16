@@ -604,9 +604,6 @@ def reset_func(ctx: GameContext):
     # 5. Set model to evaluation mode (disables dropout, batchnorm updates, etc.)
     g_model.eval()
     
-    # 6. Initialize the MCTS
-    # --- MODIFIED: Pass Dirichlet noise parameters ---
-    # `c_puct=1.41` (sqrt(2)) is a common value
     g_mcts = MCTS(model=_model_wrapper, 
                   c_puct=1.41, 
                   dirichlet_alpha=0.3, 
