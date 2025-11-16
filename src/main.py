@@ -350,31 +350,60 @@ PIECE_TO_CHANNEL = {
 }
 
 def convert_board_to_tensor(board: chess.Board, repetition_plane_value: float) -> np.ndarray:
+    """
+    Convert board to tensor matching the training data format.
+    When it's Black's turn, we mirror the board but keep castling rights in absolute White/Black order.
+    This matches how generate_data.py creates canonical positions.
+    """
     tensor = np.zeros((19, 8, 8), dtype=np.float32)
+    
     if board.turn == chess.WHITE:
+        # White's turn: straightforward representation
+        # Channels 0-5: White pieces
         for i, piece_type in enumerate(PIECES):
             for sq in board.pieces(piece_type, chess.WHITE):
                 tensor[i, chess.square_rank(sq), chess.square_file(sq)] = 1.0
+        
+        # Channels 6-11: Black pieces
         for i, piece_type in enumerate(PIECES):
             for sq in board.pieces(piece_type, chess.BLACK):
                 tensor[i + 6, chess.square_rank(sq), chess.square_file(sq)] = 1.0
+        
+        # Castling rights in absolute White/Black order (as in training data)
+        if board.has_kingside_castling_rights(chess.WHITE): tensor[12, :, :] = 1.0
+        if board.has_queenside_castling_rights(chess.WHITE): tensor[13, :, :] = 1.0
+        if board.has_kingside_castling_rights(chess.BLACK): tensor[14, :, :] = 1.0
+        if board.has_queenside_castling_rights(chess.BLACK): tensor[15, :, :] = 1.0
+        
+        # En passant square
+        ep_sq = board.ep_square
+        if ep_sq:
+            tensor[16, chess.square_rank(ep_sq), chess.square_file(ep_sq)] = 1.0
     else:
+        # Black's turn: mirror the board to create canonical position
+        # After mirroring: Channels 0-5 are Black pieces (now at bottom), 6-11 are White pieces (now at top)
+        
+        # Channels 0-5: Black pieces (mirrored)
         for i, piece_type in enumerate(PIECES):
             for sq in board.pieces(piece_type, chess.BLACK):
                 tensor[i, 7 - chess.square_rank(sq), 7 - chess.square_file(sq)] = 1.0
+        
+        # Channels 6-11: White pieces (mirrored)
         for i, piece_type in enumerate(PIECES):
             for sq in board.pieces(piece_type, chess.WHITE):
                 tensor[i + 6, 7 - chess.square_rank(sq), 7 - chess.square_file(sq)] = 1.0
-    if board.has_kingside_castling_rights(chess.WHITE): tensor[12, :, :] = 1.0
-    if board.has_queenside_castling_rights(chess.WHITE): tensor[13, :, :] = 1.0
-    if board.has_kingside_castling_rights(chess.BLACK): tensor[14, :, :] = 1.0
-    if board.has_queenside_castling_rights(chess.BLACK): tensor[15, :, :] = 1.0
-    
-    ep_sq = board.ep_square
-    if ep_sq:
-        # --- FIXED: En Passant Bug ---
-        # Was using `sq` from previous loop by mistake
-        tensor[16, chess.square_rank(ep_sq), chess.square_file(ep_sq)] = 1.0
+        
+        # CRITICAL: Castling rights stay in absolute White/Black order (NOT flipped)
+        # This matches training data where board.mirror() flips pieces but not castling rights
+        if board.has_kingside_castling_rights(chess.WHITE): tensor[12, :, :] = 1.0
+        if board.has_queenside_castling_rights(chess.WHITE): tensor[13, :, :] = 1.0
+        if board.has_kingside_castling_rights(chess.BLACK): tensor[14, :, :] = 1.0
+        if board.has_queenside_castling_rights(chess.BLACK): tensor[15, :, :] = 1.0
+        
+        # En passant square (mirrored)
+        ep_sq = board.ep_square
+        if ep_sq:
+            tensor[16, 7 - chess.square_rank(ep_sq), 7 - chess.square_file(ep_sq)] = 1.0
     
     tensor[17, :, :] = repetition_plane_value
     tensor[18, :, :] = board.halfmove_clock / 100.0
@@ -389,6 +418,9 @@ def _model_wrapper(board: chess.Board) -> tuple[dict[str, float], float]:
     3. Post-processing of policy and value outputs.
     """
     global g_model, g_move_map, g_device
+    
+    # Remember if we need to flip the policy output
+    is_black_to_move = (board.turn == chess.BLACK)
     
     # 1. Board-to-tensor conversion
     # Check for repetition to set the 17th plane
@@ -423,10 +455,33 @@ def _model_wrapper(board: chess.Board) -> tuple[dict[str, float], float]:
     # i-th logit, and the value is the UCI move string.
     policy_probs = F.softmax(policy_logits.squeeze(0), dim=0).cpu().numpy()
     
-    policy_dict_uci = {
-        move_uci: policy_probs[i] 
-        for i, move_uci in enumerate(g_move_map)
-    }
+    policy_dict_uci = {}
+    
+    if is_black_to_move:
+        # The model was trained on mirrored positions, so it outputs moves as if
+        # playing from the bottom of the board. We need to flip these moves back
+        # to the original board orientation.
+        for i, canonical_move_uci in enumerate(g_move_map):
+            if canonical_move_uci == "GAME_END":
+                continue
+            # Flip the move from the canonical (mirrored) space back to the actual board
+            try:
+                # Parse the canonical move
+                canonical_move = chess.Move.from_uci(canonical_move_uci)
+                # Flip it back to the original board orientation
+                flipped_from = chess.square_mirror(canonical_move.from_square)
+                flipped_to = chess.square_mirror(canonical_move.to_square)
+                actual_move = chess.Move(flipped_from, flipped_to, canonical_move.promotion)
+                policy_dict_uci[actual_move.uci()] = policy_probs[i]
+            except:
+                pass  # Skip invalid moves
+    else:
+        # White to move: no flipping needed
+        policy_dict_uci = {
+            move_uci: policy_probs[i] 
+            for i, move_uci in enumerate(g_move_map)
+            if move_uci != "GAME_END"
+        }
 
     # Return the NEGMAX value
     return policy_dict_uci, value_negamax
@@ -450,10 +505,36 @@ def test_func(ctx: GameContext):
     # Get the current board state from the context
     board = ctx.board
     
+    # --- NEW: Log base policy before MCTS search ---
+    print("\n--- Base Policy (Raw Model Output) ---")
+    policy_dict_uci, base_value = _model_wrapper(board.copy())
+    
+    # Get legal moves for filtering
+    legal_moves = list(board.legal_moves)
+    legal_moves_uci = [m.uci() for m in legal_moves]
+    
+    # Filter policy to only legal moves and sort by probability
+    legal_policy = [(move_uci, policy_dict_uci.get(move_uci, 0.0)) 
+                    for move_uci in legal_moves_uci]
+    legal_policy.sort(key=lambda x: x[1], reverse=True)
+    
+    # Display base value
+    print(f"Base Value Estimate: {base_value:.4f} (from current player's perspective)")
+    
+    # Display top moves from base policy
+    print(f"\nTop moves from base policy (before MCTS):")
+    print(f"{'Move':<10} | {'Probability':<12}")
+    print("-" * 24)
+    for move_uci, prob in legal_policy[:10]:  # Show top 10
+        print(f"{move_uci:<10} | {prob*100:11.6f}%")
+    
+    print(f"\nTotal legal moves: {len(legal_moves)}")
+    # ------------------------------------------------
+    
     # Set a time limit for the search (e.g., 3 seconds)
     # In a real system, you might get this from the context (e.g., ctx.time_remaining_ms)
     time_limit_sec = 3.0
-    print(f"Starting MCTS search for {time_limit_sec} seconds...")
+    print(f"\nStarting MCTS search for {time_limit_sec} seconds...")
     
     # Run the MCTS search
     # We pass a copy of the board to be safe
@@ -463,7 +544,7 @@ def test_func(ctx: GameContext):
     print(f"MCTS search complete. Best move: {best_move.uci()}")
     
     # --- NEW: Print statistics for all child moves ---
-    print("\n--- Move Statistics (Simulations) ---")
+    print("\n--- Move Statistics (After MCTS) ---")
     
     # Get a list of (move_uci, visit_count, avg_value) tuples
     move_stats = []

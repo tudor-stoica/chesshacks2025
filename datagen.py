@@ -1,423 +1,659 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import chess
-import chess.engine
-import numpy as np
-# import matplotlib.pyplot as plt # Removed plotting
-import random
-from tqdm import tqdm
-import os
-import sys
+import time
+import math
 import pickle
-import multiprocessing
-import functools
-import collections
+import numpy as np
+import os
 
-# --- CONFIGURATION ---
-STOCKFISH_PATH = r"stockfish"
-NUM_GAMES = 1000
-RANDOM_MOVE_PROB = 0.15
-STOCKFISH_TIME_LIMIT_MS = 10
-EVAL_SCALE_FACTOR = 410.0
-CPU_CORES_TO_USE = os.cpu_count() or 1
-VALIDATION_SPLIT = 0.1
-RAW_DB_FILE = 'chess_positions_db.pkl'
-ORIGINAL_TRAIN_FILE = 'chess_training_data_original.pkl'
-VALIDATION_FILE = 'validation.pkl'
+# Assuming 'utils' is a module in the same package or directory
+# If not, these might need to be defined or imported differently
+try:
+    from .utils import chess_manager, GameContext
+except ImportError:
+    # Fallback for running as a standalone script
+    print("Could not import from .utils, using placeholder classes.")
+    
+    class ChessManager:
+        def entrypoint(self, func):
+            self._entrypoint = func
+            return func
+        
+        def reset(self, func):
+            self._reset = func
+            return func
+            
+    chess_manager = ChessManager()
+    
+    class GameContext:
+        def __init__(self, board):
+            self.board = board
+            # Add other fields as needed, e.g., time_remaining_ms
+            self.time_remaining_ms = 300000 
 
-FORCE_VALUE_UNIFORM = True
-FORCE_POLICY_UNIFORM = True
-VALUE_UNIFORM_TRAIN_FILE = 'chess_training_data_value_uniform.pkl'
-POLICY_UNIFORM_TRAIN_FILE = 'chess_training_data_policy_uniform.pkl'
 
-MY_PIECES = [chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING]
-OPP_PIECES = [chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING]
+# A helper class for a single Residual Block
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, padding=1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size, padding=padding)
+        self.bn2 = nn.BatchNorm2d(out_channels)
 
-# Pre-allocate arrays for tensor conversion to avoid repeated allocation
-_TENSOR_CACHE = {}
+    def forward(self, x):
+        identity = x
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = out + identity
+        return F.relu(out)
 
-# --- HELPER FUNCTIONS ---
+# Define the "Leaner" model
+class ChessCNN(nn.Module):
+    def __init__(self, num_policy_outputs):
+        super().__init__()
+        
+        # --- Configuration ---
+        self.board_size = 8
+        self.in_channels = 19 # 19 planes
+        
+        self.num_channels = 256
+        self.num_res_blocks = 10
+        head_fc_size = 32
+        head_conv_channels = 2
+        
+        fc1_input_size = head_conv_channels * self.board_size * self.board_size
 
-def handle_stockfish_eval(info: dict) -> int:
-    score = info.get("score")
-    if score is None: return 0
-    if score.is_mate():
-        mate_in = score.relative.moves
-        return (30000 - mate_in) if mate_in > 0 else (-30000 - mate_in)
-    return score.relative.cp
+        # --- 1. Initial Convolutional Layer ---
+        self.conv_in = nn.Conv2d(self.in_channels, self.num_channels, kernel_size=3, padding=1)
+        self.bn_in = nn.BatchNorm2d(self.num_channels)
 
-# Pre-compute flip lookup table
-_FLIP_CACHE = {}
-for sq in range(64):
-    file, rank = chess.square_file(sq), chess.square_rank(sq)
-    _FLIP_CACHE[sq] = chess.square(file, 7 - rank)
+        # --- 2. Residual Stack ---
+        self.res_stack = nn.ModuleList([ResidualBlock(self.num_channels, self.num_channels) for _ in range(self.num_res_blocks)])
+        
+        self.flatten = nn.Flatten()
+        
+        # --- 3. The "Value Head" ---
+        self.value_conv = nn.Conv2d(self.num_channels, head_conv_channels, kernel_size=1)
+        self.value_bn = nn.BatchNorm2d(head_conv_channels)
+        self.value_fc1 = nn.Linear(fc1_input_size, head_fc_size)
+        self.value_fc2 = nn.Linear(head_fc_size, 1) # Final output neuron
 
-def flip_move_uci(uci_move: str) -> str:
-    if uci_move == "GAME_END": return "GAME_END"
-    try:
-        move = chess.Move.from_uci(uci_move)
-        flipped_from = _FLIP_CACHE[move.from_square]
-        flipped_to = _FLIP_CACHE[move.to_square]
-        return chess.Move(flipped_from, flipped_to, move.promotion).uci()
-    except:
-        return "GAME_END"
+        # --- 4. The "Policy Head" ---
+        self.policy_conv = nn.Conv2d(self.num_channels, head_conv_channels, kernel_size=1)
+        self.policy_bn = nn.BatchNorm2d(head_conv_channels)
+        self.policy_fc1 = nn.Linear(fc1_input_size, num_policy_outputs)
+
+    def forward(self, x):
+        # 1. Initial layer
+        x = F.relu(self.bn_in(self.conv_in(x)))
+        
+        # 2. Pass through all residual blocks
+        for block in self.res_stack:
+            x = block(x)
+            
+        # --- 3. Value Head Path ---
+        v = F.relu(self.value_bn(self.value_conv(x)))
+        v = self.flatten(v) 
+        v = F.relu(self.value_fc1(v))
+        
+        # --- UNCHANGED (as requested) ---
+        # Output remains [0, 1] as requested by user.
+        # We will convert this in the _model_wrapper.
+        value_output = torch.sigmoid(self.value_fc2(v))
+        # ---------------------------------------------------
+        
+        # --- 4. Policy Head Path ---
+        p = F.relu(self.policy_bn(self.policy_conv(x)))
+        p = self.flatten(p)
+        policy_logits = self.policy_fc1(p)
+        
+        # Return the [0, 1] value and policy logits
+        return value_output, policy_logits
+
+PIECES = [chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING]
+
+class Node:
+    """
+    A node in the MCTS tree. Stores statistics for a particular board state.
+    """
+    def __init__(self, parent, move, prior_p):
+        self.parent = parent  # Parent node
+        self.move = move      # The move that led to this node
+        self.children = {}    # A map from move (chess.Move) to Node
+        
+        self.N = 0            # Visit count
+        self.Q = 0.0          # Total value. The sum of all values backpropagated through this node.
+        self.P = prior_p      # Prior probability of selecting this node (from the model's policy)
+
+    def get_value(self):
+        """
+        Returns the average value (W) of this node.
+        Q is the total value, N is the visit count.
+        """
+        if self.N == 0:
+            return 0.0
+        return self.Q / self.N
+
+    def is_leaf(self):
+        """
+        Checks if this node is a leaf (i.e., has no expanded children).
+        """
+        return len(self.children) == 0
+
+class MCTS:
+    """
+    The main MCTS class.
+    """
+    def __init__(self, model, c_puct=2, dirichlet_alpha=0.3, dirichlet_epsilon=0.25):
+        """
+        :param model: A function that takes a chess.Board and returns (policy, value).
+                      - policy: A dictionary mapping move.uci() string to probability.
+                      - value: A float from -1 (loss) to +1 (win) for the current player.
+        :param c_puct: The exploration constant (controls trade-off between exploitation and exploration).
+        :param dirichlet_alpha: Alpha parameter for Dirichlet noise.
+        :param dirichlet_epsilon: Epsilon (weight) for Dirichlet noise.
+        """
+        self.model = model
+        self.c_puct = c_puct
+        # --- NEW: Store Dirichlet parameters ---
+        self.dirichlet_alpha = dirichlet_alpha
+        self.dirichlet_epsilon = dirichlet_epsilon
+
+    def select_best_move(self, root):
+        """
+        After the search, selects the best move from the root node.
+        The most robust choice is the one with the highest visit count.
+        """
+        best_n = -1
+        best_move = None
+        for move, child in root.children.items():
+            if child.N > best_n:
+                best_n = child.N
+                best_move = move
+        return best_move
+
+    def search(self, root_board, timelimit):
+        """
+        Runs the MCTS search for a given time limit.
+        """
+        # Create the root node
+        # The root's prior is 1.0, and it has no parent or move
+        root = Node(parent=None, move=None, prior_p=1.0)
+        
+        start_time = time.time()
+        
+        simulations= 0
+        # Main MCTS loop
+        while time.time() - start_time < timelimit:
+            # We create a copy of the board for each simulation
+            # to avoid modifying the original
+            board_sim = root_board.copy()
+            
+            simulations += 1
+            # Run one simulation (select, expand, backpropagate)
+            self.run_simulation(root, board_sim)
+            
+        # After the time is up, select the best move
+        best_move = self.select_best_move(root)
+        
+        # --- MODIFIED: Return the root node as well ---
+        return best_move, root
+
+    # --- NEW: Helper for Dirichlet Noise ---
+    def add_dirichlet_noise(self, policy_dict_uci, legal_moves):
+        """
+        Applies Dirichlet noise to the policy probabilities for exploration.
+        """
+        legal_moves_uci = [m.uci() for m in legal_moves]
+        
+        # Generate noise
+        num_legal = len(legal_moves_uci)
+        if num_legal <= 1:
+            return # No noise needed for 0 or 1 moves
+
+        noise = np.random.dirichlet([self.dirichlet_alpha] * num_legal)
+        
+        # Apply noise
+        for i, move_uci in enumerate(legal_moves_uci):
+            if move_uci in policy_dict_uci:
+                policy_dict_uci[move_uci] = (1 - self.dirichlet_epsilon) * policy_dict_uci[move_uci] + \
+                                            self.dirichlet_epsilon * noise[i]
+        
+        # Renormalize to ensure probabilities sum to 1 (optional, but good practice)
+        total_prob = sum(policy_dict_uci.get(m_uci, 0.0) for m_uci in legal_moves_uci)
+        if total_prob > 0:
+            for m_uci in legal_moves_uci:
+                if m_uci in policy_dict_uci:
+                    policy_dict_uci[m_uci] /= total_prob
+        
+    def run_simulation(self, node, board):
+        """
+        Performs one simulation from the given node.
+        This involves the 4 MCTS steps:
+        1. Selection
+        2. Expansion
+        3. Simulation (Model Evaluation)
+        4. Backpropagation
+        """
+        
+        # 1. SELECTION: Traverse the tree using PUCT
+        current_node = node
+        while not current_node.is_leaf():
+            best_move = self.select_child_puct(current_node)
+            current_node = current_node.children[best_move]
+            board.push(best_move)
+
+        # Now `current_node` is a leaf, and `board` is the state at that leaf.
+        
+        value = 0.0
+
+        # Check if the game is over at this leaf
+        if board.is_game_over():
+            result = board.result()
+            if result == "1-0":
+                value = 1.0  # White won
+            elif result == "0-1":
+                value = -1.0 # Black won
+            else:
+                value = 0.0  # Draw
+            
+            if board.turn == chess.BLACK:
+                value = -value
+
+        else:
+            is_root_expansion = (current_node.parent is None)
+            
+            policy_dict_uci, value = self.model(board)
+            
+            legal_moves = list(board.legal_moves)
+            
+            # Apply Dirichlet Noise if this is the root
+            if is_root_expansion:
+                self.add_dirichlet_noise(policy_dict_uci, legal_moves)
+            # --------------------------------------------------------
+            
+            # Create child nodes for all legal moves
+            for move in legal_moves:
+                move_uci = move.uci()
+                # Get the prior probability for this move from the model's policy
+                move_prob = policy_dict_uci.get(move_uci, 0.0)
+                
+                if move not in current_node.children:
+                    current_node.children[move] = Node(parent=current_node, move=move, prior_p=move_prob)
+
+        temp_node = current_node
+        while temp_node is not None:
+            temp_node.N += 1
+            # `value` is from the perspective of the player-to-move at the
+            # child node. We must flip it for the parent.
+            temp_node.Q += value
+            # The value flips for the parent (opponent's perspective)
+            value = -value
+            temp_node = temp_node.parent
+
+    def select_child_puct(self, node):
+        """
+        Selects the best child node to explore using the PUCT formula.
+        """
+        best_score = -float('inf')
+        best_move = None
+        
+        # Total visit count of the parent (sqrt for exploration scaling)
+        sqrt_parent_N = math.sqrt(node.N)
+
+        for move, child in node.children.items():
+            
+            # --- The PUCT Formula ---
+            # Q = Exploitation term (average value)
+            # U = Exploration term
+            
+            # Q is the value *from the perspective of the current (parent) node*
+            # child.get_value() is from the child's perspective (opponent)
+            # So, we must negate it: Q = -child.get_value()
+            Q = -child.get_value()
+            
+            # U = c_puct * P(s,a) * (sqrt(N_parent) / (1 + N_child))
+            U = self.c_puct * child.P * (sqrt_parent_N / (1 + child.N))
+            
+            score = Q + U
+            
+            if score > best_score:
+                best_score = score
+                best_move = move
+                
+        return best_move
+
+g_model = None
+g_move_map = None
+g_device = None
+g_mcts = None
+
+MODEL_FILE = "chess_cnn.pth"
+MAP_FILE = "chess_cnn_move_map.pkl"
+
+PIECE_TO_CHANNEL = {
+    (chess.PAWN, chess.WHITE): 0,
+    (chess.KNIGHT, chess.WHITE): 1,
+    (chess.BISHOP, chess.WHITE): 2,
+    (chess.ROOK, chess.WHITE): 3,
+    (chess.QUEEN, chess.WHITE): 4,
+    (chess.KING, chess.WHITE): 5,
+    (chess.PAWN, chess.BLACK): 6,
+    (chess.KNIGHT, chess.BLACK): 7,
+    (chess.BISHOP, chess.BLACK): 8,
+    (chess.ROOK, chess.BLACK): 9,
+    (chess.QUEEN, chess.BLACK): 10,
+    (chess.KING, chess.BLACK): 11,
+}
 
 def convert_board_to_tensor(board: chess.Board, repetition_plane_value: float) -> np.ndarray:
-    tensor = np.zeros((19, 8, 8), dtype=np.float16)
+    """
+    Convert board to tensor matching the training data format.
+    When it's Black's turn, we mirror the board but keep castling rights in absolute White/Black order.
+    This matches how generate_data.py creates canonical positions.
+    """
+    tensor = np.zeros((19, 8, 8), dtype=np.float32)
     
-    # My pieces (White)
-    for i, piece_type in enumerate(MY_PIECES):
-        for sq in board.pieces(piece_type, chess.WHITE):
-            rank, file = chess.square_rank(sq), chess.square_file(sq)
-            tensor[i, rank, file] = 1.0
+    if board.turn == chess.WHITE:
+        # White's turn: straightforward representation
+        # Channels 0-5: White pieces
+        for i, piece_type in enumerate(PIECES):
+            for sq in board.pieces(piece_type, chess.WHITE):
+                tensor[i, chess.square_rank(sq), chess.square_file(sq)] = 1.0
+        
+        # Channels 6-11: Black pieces
+        for i, piece_type in enumerate(PIECES):
+            for sq in board.pieces(piece_type, chess.BLACK):
+                tensor[i + 6, chess.square_rank(sq), chess.square_file(sq)] = 1.0
+        
+        # Castling rights in absolute White/Black order (as in training data)
+        if board.has_kingside_castling_rights(chess.WHITE): tensor[12, :, :] = 1.0
+        if board.has_queenside_castling_rights(chess.WHITE): tensor[13, :, :] = 1.0
+        if board.has_kingside_castling_rights(chess.BLACK): tensor[14, :, :] = 1.0
+        if board.has_queenside_castling_rights(chess.BLACK): tensor[15, :, :] = 1.0
+        
+        # En passant square
+        ep_sq = board.ep_square
+        if ep_sq:
+            tensor[16, chess.square_rank(ep_sq), chess.square_file(ep_sq)] = 1.0
+    else:
+        # Black's turn: mirror the board to create canonical position
+        # After mirroring: Channels 0-5 are Black pieces (now at bottom), 6-11 are White pieces (now at top)
+        
+        # Channels 0-5: Black pieces (mirrored)
+        for i, piece_type in enumerate(PIECES):
+            for sq in board.pieces(piece_type, chess.BLACK):
+                tensor[i, 7 - chess.square_rank(sq), 7 - chess.square_file(sq)] = 1.0
+        
+        # Channels 6-11: White pieces (mirrored)
+        for i, piece_type in enumerate(PIECES):
+            for sq in board.pieces(piece_type, chess.WHITE):
+                tensor[i + 6, 7 - chess.square_rank(sq), 7 - chess.square_file(sq)] = 1.0
+        
+        # CRITICAL: Castling rights stay in absolute White/Black order (NOT flipped)
+        # This matches training data where board.mirror() flips pieces but not castling rights
+        if board.has_kingside_castling_rights(chess.WHITE): tensor[12, :, :] = 1.0
+        if board.has_queenside_castling_rights(chess.WHITE): tensor[13, :, :] = 1.0
+        if board.has_kingside_castling_rights(chess.BLACK): tensor[14, :, :] = 1.0
+        if board.has_queenside_castling_rights(chess.BLACK): tensor[15, :, :] = 1.0
+        
+        # En passant square (mirrored)
+        ep_sq = board.ep_square
+        if ep_sq:
+            tensor[16, 7 - chess.square_rank(ep_sq), 7 - chess.square_file(ep_sq)] = 1.0
     
-    # Opponent pieces (Black)
-    for i, piece_type in enumerate(OPP_PIECES):
-        for sq in board.pieces(piece_type, chess.BLACK):
-            rank, file = chess.square_rank(sq), chess.square_file(sq)
-            tensor[i + 6, rank, file] = 1.0
-    
-    # Castling rights (broadcast to full plane)
-    if board.has_kingside_castling_rights(chess.WHITE): tensor[12] = 1.0
-    if board.has_queenside_castling_rights(chess.WHITE): tensor[13] = 1.0
-    if board.has_kingside_castling_rights(chess.BLACK): tensor[14] = 1.0
-    if board.has_queenside_castling_rights(chess.BLACK): tensor[15] = 1.0
-    
-    # En passant
-    ep_sq = board.ep_square
-    if ep_sq is not None:
-        rank, file = chess.square_rank(ep_sq), chess.square_file(ep_sq)
-        tensor[16, rank, file] = 1.0
-    
-    tensor[17] = repetition_plane_value
-    tensor[18] = board.halfmove_clock / 100.0
+    tensor[17, :, :] = repetition_plane_value
+    tensor[18, :, :] = board.halfmove_clock / 100.0
     return tensor
 
-# Vectorized sigmoid (faster than per-value)
-def calculate_value(eval_cp: int) -> float:
-    scaled = eval_cp / EVAL_SCALE_FACTOR
-    return 1.0 / (1.0 + np.exp(-scaled))
+def _model_wrapper(board: chess.Board) -> tuple[dict[str, float], float]:
+    """
+    A wrapper function that adheres to the MCTS's expected `model(board)` signature.
+    It handles:
+    1. Board-to-tensor conversion.
+    2. Model inference.
+    3. Post-processing of policy and value outputs.
+    """
+    global g_model, g_move_map, g_device
+    
+    # 1. Board-to-tensor conversion
+    # Check for repetition to set the 17th plane
+    repetition_val = 1.0 if board.is_repetition(count=2) else 0.0
+    tensor_np = convert_board_to_tensor(board, repetition_val)
+    
+    # Convert to PyTorch tensor, add batch dim, and send to device
+    tensor_torch = torch.from_numpy(tensor_np).unsqueeze(0).to(g_device)
 
-# --- OPTIMIZED GAME WORKER ---
-def play_game_worker(game_index, existing_fens_set, random_prob, time_limit_ms, stockfish_path):
-    if game_index == 0: 
-        print("--- Using optimized v4 worker. ---")
+    # 2. Model inference
+    with torch.no_grad():
+        # Model returns (value_output, policy_logits)
+        # value_output is in the [0, 1] range (due to sigmoid)
+        value_output_sigmoid, policy_logits = g_model(tensor_torch)
+
+    # 3. Post-processing
     
-    engine = None
-    new_positions_found = {}
+    # --- Process Value ---
+    # --- CRITICAL FIX: Convert [0, 1] sigmoid to [-1, 1] negamax range ---
+    # This scales the [0, 1] output to the [-1, 1] range
+    # 0.0 -> -1.0 (loss)
+    # 0.5 ->  0.0 (draw)
+    # 1.0 -> +1.0 (win)
+    # This allows the MCTS's `value = -value` logic to work correctly.
+    value_sigmoid = value_output_sigmoid.item()
+    value_negamax = (value_sigmoid * 2.0) - 1.0
+    # --------------------------------------------------------------------
+
+    # --- Process Policy ---
+    # The model outputs raw logits. We apply softmax to get probabilities.
+    # g_move_map is assumed to be a list where index 'i' corresponds to the
+    # i-th logit, and the value is the UCI move string.
+    policy_probs = F.softmax(policy_logits.squeeze(0), dim=0).cpu().numpy()
     
+    policy_dict_uci = {
+        move_uci: policy_probs[i] 
+        for i, move_uci in enumerate(g_move_map)
+    }
+
+    # Return the NEGMAX value
+    return policy_dict_uci, value_negamax
+
+# --- Updated Entrypoint ---
+
+@chess_manager.entrypoint
+def test_func(ctx: GameContext):
+    """
+    This is the main "thinking" function. It's called when the engine
+    needs to decide on a move.
+    """
+    global g_mcts
+    
+    # Ensure the model and MCTS are loaded.
+    # This is a safety check in case reset wasn't called.
+    if g_mcts is None:
+        print("MCTS not initialized, calling reset_func...")
+        reset_func(ctx)
+
+    # Get the current board state from the context
+    board = ctx.board
+    
+    # --- NEW: Log base policy before MCTS search ---
+    print("\n--- Base Policy (Raw Model Output) ---")
+    policy_dict_uci, base_value = _model_wrapper(board.copy())
+    
+    # Get legal moves for filtering
+    legal_moves = list(board.legal_moves)
+    legal_moves_uci = [m.uci() for m in legal_moves]
+    
+    # Filter policy to only legal moves and sort by probability
+    legal_policy = [(move_uci, policy_dict_uci.get(move_uci, 0.0)) 
+                    for move_uci in legal_moves_uci]
+    legal_policy.sort(key=lambda x: x[1], reverse=True)
+    
+    # Display base value
+    print(f"Base Value Estimate: {base_value:.4f} (from current player's perspective)")
+    
+    # Display top moves from base policy
+    print(f"\nTop moves from base policy (before MCTS):")
+    print(f"{'Move':<10} | {'Probability':<12}")
+    print("-" * 24)
+    for move_uci, prob in legal_policy[:10]:  # Show top 10
+        print(f"{move_uci:<10} | {prob*100:11.6f}%")
+    
+    print(f"\nTotal legal moves: {len(legal_moves)}")
+    # ------------------------------------------------
+    
+    # Set a time limit for the search (e.g., 3 seconds)
+    # In a real system, you might get this from the context (e.g., ctx.time_remaining_ms)
+    time_limit_sec = 3.0
+    print(f"\nStarting MCTS search for {time_limit_sec} seconds...")
+    
+    # Run the MCTS search
+    # We pass a copy of the board to be safe
+    # --- MODIFIED: Receive the 'root_node' back from search ---
+    best_move, root_node = g_mcts.search(board.copy(), timelimit=time_limit_sec)
+    
+    print(f"MCTS search complete. Best move: {best_move.uci()}")
+    
+    # --- NEW: Print statistics for all child moves ---
+    print("\n--- Move Statistics (After MCTS) ---")
+    
+    # Get a list of (move_uci, visit_count, avg_value) tuples
+    move_stats = []
+    if root_node and root_node.N > 0: # Avoid division by zero if no sims ran
+        for move, child_node in root_node.children.items():
+            if child_node.N > 0:
+                # child.get_value() is value from child's perspective (opponent)
+                # We negate it to get the value for the current player
+                avg_value = -child_node.get_value() 
+                move_stats.append((move.uci(), child_node.N, avg_value))
+                
+        # Sort by visit count (most simulations first)
+        move_stats.sort(key=lambda item: item[1], reverse=True)
+        
+        # Print the sorted list
+        total_sims = root_node.N
+        print(f"Total simulations from root: {total_sims}")
+        print(f"{'Move':<10} | {'Visits':<10} | {'Percentage':<12} | {'Value (for me)':<15}")
+        print("-" * 52) # Adjusted width
+        for move_uci, n, val in move_stats:
+            percentage = (n / total_sims) * 100
+            print(f"{move_uci:<10} | {n:<10} | {percentage:11.2f}% | {val:14.4f}")
+    else:
+        print("No simulations were run or root node is invalid.")
+    # -------------------------------------------------
+    
+    print("\n") # Add a newline for cleaner logs
+    
+    # Return the best move found by the search
+    return best_move
+
+@chess_manager.reset
+def reset_func(ctx: GameContext):
+    """
+    This function is called once to initialize the engine, load models,
+    and set up the MCTS.
+    """
+    global g_model, g_move_map, g_device, g_mcts
+    
+    print("--- Resetting and loading model ---")
+    
+    # --- MODIFICATION: Build absolute paths relative to this script file ---
+    # __file__ is a special variable in Python that holds the path to the current script.
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    map_path = os.path.join(script_dir, MAP_FILE)
+    model_path = os.path.join(script_dir, MODEL_FILE)
+    # ---------------------------------------------------------------------
+    
+    # 1. Set device
+    g_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {g_device}")
+    
+    # 2. Load the move map
     try:
-        engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
-        engine.configure({"Threads": 1, "Hash": 16})
-        
-        board = chess.Board()
-        game_fen_history = {}
-        time_limit_sec = time_limit_ms / 1000.0
-
-        while True:
-            is_terminal = board.is_game_over(claim_draw=True)
-            
-            # Fast FEN base (avoid rsplit on large strings)
-            fen_full = board.fen()
-            last_space = fen_full.rfind(' ')
-            second_last_space = fen_full.rfind(' ', 0, last_space)
-            base_fen = fen_full[:second_last_space]
-            
-            repetition_count = game_fen_history.get(base_fen, 0) + 1
-            game_fen_history[base_fen] = repetition_count
-            
-            is_repetition_draw = (repetition_count >= 2)
-            is_game_over = is_terminal or is_repetition_draw
-            repetition_plane_value = 1.0 if repetition_count > 1 else 0.0
-
-            best_move_uci = "GAME_END"
-            eval_cp = 0
-            
-            try:
-                # Single Stockfish call
-                result = engine.analyse(board, chess.engine.Limit(time=time_limit_sec))
-                eval_cp = handle_stockfish_eval(result)
-
-                if not is_game_over:
-                    pv = result.get("pv")
-                    if pv:
-                        best_move_uci = pv[0].uci()
-                elif is_repetition_draw and not is_terminal:
-                    eval_cp = 0
-
-            except (chess.engine.EngineError, chess.engine.EngineTerminatedError): 
-                break
-
-            # Canonical position (flip if Black to move)
-            if board.turn == chess.WHITE:
-                canonical_fen = fen_full
-                canonical_move_uci = best_move_uci
-                canonical_eval_cp = eval_cp
-            else:
-                canonical_fen = board.mirror().fen()
-                canonical_move_uci = flip_move_uci(best_move_uci)
-                canonical_eval_cp = eval_cp
-            
-            position_key = (canonical_fen, repetition_plane_value)
-            
-            # Only store new positions
-            if position_key not in existing_fens_set and position_key not in new_positions_found:
-                new_positions_found[position_key] = (canonical_move_uci, canonical_eval_cp)
-
-            if is_game_over: 
-                break
-            
-            # Decide move
-            if random.random() <= random_prob:
-                # Random move
-                legal_moves = list(board.legal_moves)
-                if not legal_moves: break
-                move_to_play = random.choice(legal_moves)
-            else:
-                # Best move
-                if best_move_uci == "GAME_END":
-                    legal_moves = list(board.legal_moves)
-                    if not legal_moves: break
-                    move_to_play = legal_moves[0]
-                else:
-                    move_to_play = chess.Move.from_uci(best_move_uci) if board.turn == chess.WHITE else chess.Move.from_uci(flip_move_uci(best_move_uci))
-                    # Validate move is legal
-                    if move_to_play not in board.legal_moves:
-                        legal_moves = list(board.legal_moves)
-                        if not legal_moves: break
-                        move_to_play = legal_moves[0]
-
-            board.push(move_to_play)
-
-    except Exception:
-        pass
-    finally:
-        if engine: 
-            engine.quit()
-            
-    return new_positions_found
-
-def run_playouts(num_games: int, random_prob: float, existing_fens_set: set, num_workers: int) -> tuple:
-    print(f"Running {num_games} new playouts in parallel on {num_workers} cores...")
-    worker_func = functools.partial(play_game_worker,
-                                    existing_fens_set=existing_fens_set,
-                                    random_prob=random_prob,
-                                    time_limit_ms=STOCKFISH_TIME_LIMIT_MS,
-                                    stockfish_path=STOCKFISH_PATH)
-    
-    with multiprocessing.Pool(processes=num_workers) as pool:
-        results_list = list(tqdm(pool.imap_unordered(worker_func, range(num_games)), 
-                                 total=num_games, desc="Playing Games"))
-    
-    print("\nMerging results from workers...")
-    new_raw_data_dict = {}
-    for new_positions_found in results_list:
-        new_raw_data_dict.update(new_positions_found)
-    
-    return new_raw_data_dict, len(new_raw_data_dict)
-
-def process_position_worker(item):
-    try:
-        position_key, (canonical_move_uci, eval_cp) = item
-        fen, repetition_plane_value = position_key
-        
-        board = chess.Board(fen)
-        board_tensor = convert_board_to_tensor(board, repetition_plane_value)
-        value_target = calculate_value(eval_cp)
-        
-        return (board_tensor, value_target, canonical_move_uci)
-    except:
-        return None
-
-def process_data(raw_positions_dict: dict, num_workers: int) -> list:
-    print(f"Processing {len(raw_positions_dict)} raw positions in parallel on {num_workers} cores...")
-    data_items_list = list(raw_positions_dict.items())
-    
-    if not data_items_list:
-        print("No data to process.")
-        return []
-    
-    # Larger chunksize for efficiency
-    chunksize = max(100, len(data_items_list) // (num_workers * 2))
-    
-    with multiprocessing.Pool(processes=num_workers) as pool:
-        results_list = list(tqdm(pool.imap_unordered(process_position_worker, data_items_list, 
-                                                     chunksize=chunksize), 
-                                 total=len(data_items_list), desc="Processing Data"))
-    
-    training_data = [result for result in results_list if result is not None]
-    print(f"\nSuccessfully processed {len(training_data)} positions.")
-    return training_data
-
-# --- Removed plot_value_distribution function ---
-
-# --- Removed plot_policy_distribution function ---
-
-def load_raw_db(filename: str) -> dict:
-    if os.path.exists(filename):
-        print(f"Loading existing position database from {filename}...")
-        with open(filename, 'rb') as f:
-            try: 
-                return pickle.load(f)
-            except: 
-                return {}
-    print("No existing position database found. Starting fresh.")
-    return {}
-
-def load_processed_data(filename: str) -> list:
-    if os.path.exists(filename):
-        print(f"Loading existing processed data from {filename}...")
-        with open(filename, 'rb') as f:
-            try: 
-                return pickle.load(f)
-            except: 
-                return []
-    print(f"No existing processed data found at {filename}. Starting fresh.")
-    return []
-
-def save_raw_db(filename: str, data: dict):
-    print(f"Saving updated position database ({len(data)} positions) to {filename}...")
-    with open(filename, 'wb') as f:
-        pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-def save_processed_data(filename: str, data: list):
-    print(f"Saving processed training data ({len(data)} samples) to {filename}...")
-    with open(filename, 'wb') as f:
-        pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-def create_value_uniform_dataset_by_pruning(training_data: list) -> list:
-    print("Creating uniform *value* distribution dataset (Pruning to Min Height)...")
-    if not training_data:
-        print("Cannot create uniform dataset: No training data.")
-        return []
-    
-    binned_data = {i: [] for i in range(20)}
-    for sample in training_data:
-        value = sample[1]
-        bin_index = 19 if value == 1.0 else int(value * 20)
-        binned_data[bin_index].append(sample)
-    
-    bin_heights = [len(samples) for samples in binned_data.values() if samples]
-    if not bin_heights:
-        print("No data in any bins. Skipping uniform creation.")
-        return []
-    
-    target_bin_height = min(bin_heights)
-    print(f"Target (min) bin height: {target_bin_height}")
-    
-    uniform_data = []
-    for samples in binned_data.values():
-        if samples:
-            random.shuffle(samples)
-            uniform_data.extend(samples[:target_bin_height])
-    
-    print(f"Created value-uniform dataset with {len(uniform_data)} samples (by pruning).")
-    return uniform_data
-
-def create_policy_uniform_dataset_by_pruning(training_data: list) -> list:
-    print("Creating uniform *policy* distribution dataset (Pruning to Min Height)...")
-    if not training_data:
-        print("Cannot create uniform dataset: No training data.")
-        return []
-    
-    binned_data = {}
-    for sample in training_data:
-        move_uci = sample[2]
-        if move_uci not in binned_data:
-            binned_data[move_uci] = []
-        binned_data[move_uci].append(sample)
-    
-    bin_heights = [len(samples) for samples in binned_data.values() if samples]
-    if not bin_heights:
-        print("No data in any move bins. Skipping uniform creation.")
-        return []
-    
-    target_bin_height = min(bin_heights)
-    print(f"Target (min) move count: {target_bin_height}")
-    
-    uniform_data = []
-    for samples in binned_data.values():
-        if samples:
-            random.shuffle(samples)
-            uniform_data.extend(samples[:target_bin_height])
-    
-    print(f"Created policy-uniform dataset with {len(uniform_data)} samples (by pruning).")
-    return uniform_data
-
-def main():
-    if not STOCKFISH_PATH or not os.path.exists(STOCKFISH_PATH):
-        print("="*50)
-        print(f"ERROR: Stockfish not found at: {STOCKFISH_PATH}")
-        print("="*50)
-        sys.exit(1)
-
-    try:
-        all_positions_data = load_raw_db(RAW_DB_FILE)
-        initial_position_count = len(all_positions_data)
-        print(f"Loaded {initial_position_count} unique canonical positions.")
-        
-        existing_fens_set = set(all_positions_data.keys())
-
-        new_raw_data, new_positions_added = run_playouts(NUM_GAMES, 
-                                                         RANDOM_MOVE_PROB, 
-                                                         existing_fens_set, 
-                                                         CPU_CORES_TO_USE)
-        
-        if new_positions_added == 0:
-            print("\nNo new unique positions were added. Exiting.")
-            return
-
-        print(f"\nAdded {new_positions_added} new unique canonical positions.")
-        
-        new_processed_data = process_data(new_raw_data, CPU_CORES_TO_USE)
-        
-        if not new_processed_data:
-            print("Processing failed to produce any new training samples. Exiting.")
-            return
-
-        all_positions_data.update(new_raw_data)
-        save_raw_db(RAW_DB_FILE, all_positions_data)
-        print(f"Total unique positions in database now: {len(all_positions_data)}")
-
-        np.random.shuffle(new_processed_data)
-        val_split_index = int(len(new_processed_data) * VALIDATION_SPLIT)
-        
-        new_val_data = new_processed_data[:val_split_index]
-        new_train_data = new_processed_data[val_split_index:]
-        
-        print(f"Split new data: {len(new_train_data)} training samples, {len(new_val_data)} validation samples.")
-
-        all_train_data = load_processed_data(ORIGINAL_TRAIN_FILE)
-        all_val_data = load_processed_data(VALIDATION_FILE)
-        
-        all_train_data.extend(new_train_data)
-        all_val_data.extend(new_val_data)
-        
-        print(f"\nTotal training samples (original): {len(all_train_data)}")
-        print(f"Total validation samples: {len(all_val_data)}")
-
-        if FORCE_VALUE_UNIFORM:
-            value_uniform_data = create_value_uniform_dataset_by_pruning(all_train_data)
-            if value_uniform_data:
-                save_processed_data(VALUE_UNIFORM_TRAIN_FILE, value_uniform_data)
-                # plot_value_distribution(value_uniform_data, title_suffix=" (Value Uniform Training Set)") # Removed
-        
-        if FORCE_POLICY_UNIFORM:
-            policy_uniform_data = create_policy_uniform_dataset_by_pruning(all_train_data)
-            if policy_uniform_data:
-                save_processed_data(POLICY_UNIFORM_TRAIN_FILE, policy_uniform_data)
-                # plot_policy_distribution(policy_uniform_data, title_suffix=" (Policy Uniform Training Set)") # Removed
-        
-        # plot_value_distribution(all_train_data, title_suffix=" (Original Training Set)") # Removed
-        # plot_policy_distribution(all_train_data, title_suffix=" (Original Training Set)") # Removed
-        
-        save_processed_data(ORIGINAL_TRAIN_FILE, all_train_data)
-        save_processed_data(VALIDATION_FILE, all_val_data)
-        print(f"New total validation samples: {len(all_val_data)}")
-
+        # Use the absolute path
+        print(f"Loading move map from: {map_path}")
+        with open(map_path, 'rb') as f:
+            # train.py saves a dict: {'MOVE_TO_INDEX': ..., 'INDEX_TO_MOVE': ...}
+            move_map_dict = pickle.load(f)
+            # We need the INDEX_TO_MOVE list for our MCTS wrapper
+            g_move_map = move_map_dict['INDEX_TO_MOVE']
     except Exception as e:
-        print(f"\nAn unexpected error occurred in main: {e}")
-    
-    print("Script finished.")
+        # Print the full path on error for easier debugging
+        print(f"Error loading move map '{map_path}': {e}")
+        return
 
+    num_policy_outputs = len(g_move_map)
+    print(f"Loaded move map with {num_policy_outputs} possible moves.")
+
+    # 3. Initialize the model
+    g_model = ChessCNN(num_policy_outputs=num_policy_outputs).to(g_device)
+    
+    # 4. Load model weights
+    try:
+        # Use the absolute path
+        print(f"Loading model weights from: {model_path}")
+        g_model.load_state_dict(torch.load(model_path, map_location=g_device))
+    except Exception as e:
+        # Print the full path on error for easier debugging
+        print(f"Error loading model weights '{model_path}': {e}")
+        return
+        
+    # 5. Set model to evaluation mode (disables dropout, batchnorm updates, etc.)
+    g_model.eval()
+    
+    # 6. Initialize the MCTS
+    # --- MODIFIED: Pass Dirichlet noise parameters ---
+    # `c_puct=1.41` (sqrt(2)) is a common value
+    g_mcts = MCTS(model=_model_wrapper, 
+                  c_puct=1.41, 
+                  dirichlet_alpha=0.3, 
+                  dirichlet_epsilon=0.25)
+    
+    print("--- Model and MCTS initialized successfully ---")
+
+# --- Example of how to run (if this script is executed directly) ---
 if __name__ == "__main__":
-    multiprocessing.set_start_method("spawn", force=True)
-    main()
+    print("Running a test of the chess AI script...")
+    
+    # Create a dummy context and board
+    test_board = chess.Board()
+    test_ctx = GameContext(board=test_board)
+    
+    # 1. Call reset to load models (this happens automatically in the real env)
+    reset_func(test_ctx)
+    
+    # 2. Check if loading was successful
+    if g_mcts:
+        print("\n--- Starting a test game ---")
+        print(test_ctx.board)
+        
+        # 3. Ask for the first move
+        # Use the entrypoint function directly
+        move1 = chess_manager._entrypoint(test_ctx)
+        test_ctx.board.push(move1)
+        print(f"\nAI moved: {move1.uci()}")
+        print(test_ctx.board)
+        
+        # 4. Make a simple opponent move
+        opponent_move = chess.Move.from_uci("e7e6") # A simple pawn move
+        if opponent_move in test_ctx.board.legal_moves:
+            test_ctx.board.push(opponent_move)
+            print(f"\nOpponent moved: {opponent_move.uci()}")
+            print(test_ctx.board)
+            
+            # 5. Ask for the second AI move
+            # Use the entrypoint function directly
+            move2 = chess_manager._entrypoint(test_ctx)
+            test_ctx.board.push(move2)
+            print(f"\nAI moved: {move2.uci()}")
+            print(test_ctx.board)
+        else:
+            print(f"Test move {opponent_move.uci()} is not legal.")
+    
+    else:
+        print("\nTest run failed: MCTS was not initialized.")
+        print("This is likely because the model files ('chess_cnn.pth' and 'chess_cnn_move_map.pkl')")
+        print(f"were not found in the same directory as this script: {os.path.dirname(os.path.abspath(__file__))}")
