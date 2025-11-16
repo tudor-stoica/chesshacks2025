@@ -306,7 +306,7 @@ g_device = None
 g_mcts = None
 
 MODEL_FILE = "chess_cnn_fp16.pth"
-MAP_FILE = "chess_cnn_move_map_small.pkl"
+MAP_FILE = "chess_cnn_move_map.pkl"
 
 PIECE_TO_CHANNEL = {
     (chess.PAWN, chess.WHITE): 0,
